@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
+import os
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,7 @@ import yaml
 from pydantic import BaseModel, Field
 
 from easy_agent.models import RunContext, ToolSpec
+from easy_agent.sandbox import SandboxManager, SandboxRequest, SandboxTarget
 from easy_agent.tools import ToolHandler, ToolRegistry
 
 
@@ -21,9 +23,11 @@ class SkillMetadata(BaseModel):
     command: list[str] = Field(default_factory=list)
     args_template: list[str] = Field(default_factory=list)
     env_passthrough: list[str] = Field(default_factory=list)
+    timeout_seconds: float = 15.0
     input_schema: dict[str, Any] = Field(
         default_factory=lambda: {"type": "object", "properties": {}, "additionalProperties": True}
     )
+
 
 
 def _token_allowed(tokens: list[str], allowed_prefixes: list[list[str]]) -> bool:
@@ -31,9 +35,15 @@ def _token_allowed(tokens: list[str], allowed_prefixes: list[list[str]]) -> bool
 
 
 class SkillLoader:
-    def __init__(self, skill_paths: list[Path], allowed_commands: list[list[str]]) -> None:
+    def __init__(
+        self,
+        skill_paths: list[Path],
+        allowed_commands: list[list[str]],
+        sandbox_manager: SandboxManager,
+    ) -> None:
         self.skill_paths = skill_paths
         self.allowed_commands = allowed_commands
+        self.sandbox_manager = sandbox_manager
 
     def discover(self) -> list[tuple[SkillMetadata, Path]]:
         discovered: list[tuple[SkillMetadata, Path]] = []
@@ -107,14 +117,27 @@ class SkillLoader:
             tokens = metadata.command + rendered_args
             if not _token_allowed(tokens, self.allowed_commands):
                 raise PermissionError(f"Command is not allowed by whitelist: {tokens}")
-            result = subprocess.run(
-                tokens,
-                cwd=base_path,
-                capture_output=True,
-                text=True,
-                check=True,
-                timeout=15,
+            env = {
+                key: os.environ[key]
+                for key in metadata.env_passthrough
+                if key in os.environ
+            }
+            result = self.sandbox_manager.run(
+                SandboxRequest(
+                    command=tokens,
+                    cwd=base_path,
+                    env=env,
+                    timeout_seconds=metadata.timeout_seconds,
+                    target=SandboxTarget.COMMAND_SKILL,
+                )
             )
-            return {"stdout": result.stdout.strip(), "stderr": result.stderr.strip()}
+            if result.returncode != 0:
+                raise subprocess.CalledProcessError(
+                    result.returncode,
+                    tokens,
+                    output=result.stdout,
+                    stderr=result.stderr,
+                )
+            return {"stdout": result.stdout, "stderr": result.stderr}
 
         return _run

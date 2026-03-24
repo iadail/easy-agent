@@ -10,6 +10,7 @@ import pytest
 
 from easy_agent.config import McpServerConfig
 from easy_agent.mcp import McpClientManager
+from easy_agent.sandbox import SandboxManager, SandboxMode, SandboxTarget
 
 STDIO_SERVER = r"""
 import asyncio
@@ -38,9 +39,7 @@ def write_message(payload):
 async def main():
     while True:
         request = await read_message()
-        if request["method"] == "initialize":
-            write_message({"jsonrpc": "2.0", "id": request["id"], "result": {"ok": True}})
-        elif request["method"] == "tools/list":
+        if request["method"] == "tools/list":
             write_message({"jsonrpc": "2.0", "id": request["id"], "result": {"tools": [{"name": "echo", "description": "Echo", "inputSchema": {"type": "object"}}]}})
         elif request["method"] == "tools/call":
             write_message({"jsonrpc": "2.0", "id": request["id"], "result": {"content": request["params"]["arguments"]}})
@@ -89,6 +88,11 @@ async def test_mcp_manager_supports_stdio_and_http_sse() -> None:
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     rpc_port = server.server_address[1]
+    sandbox_manager = SandboxManager(
+        mode=SandboxMode.PROCESS,
+        targets=[SandboxTarget.STDIO_MCP],
+        env_allowlist=["PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "TEMP", "TMP"],
+    )
     manager = McpClientManager(
         [
             McpServerConfig(
@@ -102,7 +106,8 @@ async def test_mcp_manager_supports_stdio_and_http_sse() -> None:
                 rpc_url=f"http://127.0.0.1:{rpc_port}/rpc",
                 sse_url=f"http://127.0.0.1:{rpc_port}/sse",
             ),
-        ]
+        ],
+        sandbox_manager,
     )
 
     await manager.start()

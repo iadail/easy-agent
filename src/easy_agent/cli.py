@@ -19,8 +19,10 @@ from easy_agent.runtime import EasyAgentRuntime, build_runtime
 app = typer.Typer(help="Colorful CLI for the easy-agent foundation.")
 skills_app = typer.Typer()
 mcp_app = typer.Typer()
+plugins_app = typer.Typer()
 app.add_typer(skills_app, name="skills")
 app.add_typer(mcp_app, name="mcp")
+app.add_typer(plugins_app, name="plugins")
 console = Console()
 
 
@@ -43,6 +45,7 @@ def doctor(
 ) -> None:
     async def _run(runtime: EasyAgentRuntime) -> None:
         adapter = resolve_protocol(runtime.config.model)
+        sandbox = runtime.sandbox_manager.describe()
         table = Table(title="easy-agent doctor")
         table.add_column("Check", style="cyan")
         table.add_column("Value", style="green")
@@ -50,7 +53,11 @@ def doctor(
         table.add_row("Platform", platform.platform())
         table.add_row("Protocol", adapter.protocol.value)
         table.add_row("Skills", str(len(runtime.skills)))
-        table.add_row("MCP Servers", str(len(runtime.config.mcp)))
+        table.add_row("MCP Servers", str(len(runtime.mcp_manager._clients)))
+        table.add_row("Loaded Sources", str(len(runtime.loaded_sources)))
+        table.add_row("Sandbox Mode", sandbox["mode"])
+        table.add_row("Sandbox Targets", ", ".join(sandbox["targets"]))
+        table.add_row("Windows Sandbox", str(sandbox["windows_sandbox_available"]))
         table.add_row("Storage", str(runtime.store.base_path.resolve()))
         console.print(table)
         if smoke:
@@ -121,3 +128,16 @@ def list_mcp(config: str = typer.Option("easy-agent.yml", "-c", "--config")) -> 
         console.print(table)
 
     asyncio.run(_with_runtime(config, _run))
+
+
+@plugins_app.command("list")
+def list_plugins(config: str = typer.Option("easy-agent.yml", "-c", "--config")) -> None:
+    runtime = build_runtime(config)
+    try:
+        table = Table(title="plugins")
+        table.add_column("Source", style="cyan")
+        for source in runtime.loaded_sources:
+            table.add_row(source)
+        console.print(table)
+    finally:
+        asyncio.run(runtime.aclose())

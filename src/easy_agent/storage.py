@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,7 @@ class SQLiteRunStore:
         return sqlite3.connect(self.db_path)
 
     def _init_db(self) -> None:
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS runs (
@@ -50,20 +51,23 @@ class SQLiteRunStore:
                 );
                 """
             )
+            connection.commit()
 
     def create_run(self, run_id: str, graph_name: str, input_payload: Any) -> None:
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             connection.execute(
                 "INSERT INTO runs(run_id, graph_name, status, input_payload, created_at) VALUES (?, ?, ?, ?, ?)",
                 (run_id, graph_name, "running", json.dumps(input_payload), self._now()),
             )
+            connection.commit()
 
     def finish_run(self, run_id: str, status: str, output_payload: Any) -> None:
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             connection.execute(
                 "UPDATE runs SET status = ?, output_payload = ? WHERE run_id = ?",
                 (status, json.dumps(output_payload), run_id),
             )
+            connection.commit()
 
     def record_node(
         self,
@@ -74,7 +78,7 @@ class SQLiteRunStore:
         output: Any,
         error: str | None,
     ) -> None:
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             connection.execute(
                 """
                 INSERT INTO node_events(run_id, node_id, status, attempt, output_payload, error_message, created_at)
@@ -82,19 +86,21 @@ class SQLiteRunStore:
                 """,
                 (run_id, node_id, status, attempt, json.dumps(output), error, self._now()),
             )
+            connection.commit()
 
     def record_event(self, run_id: str, kind: str, payload: Any) -> None:
         encoded = json.dumps(payload)
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             connection.execute(
                 "INSERT INTO events(run_id, kind, payload, created_at) VALUES (?, ?, ?, ?)",
                 (run_id, kind, encoded, self._now()),
             )
+            connection.commit()
         with (self.trace_path / f"{run_id}.jsonl").open("a", encoding="utf-8") as handle:
             handle.write(json.dumps({"kind": kind, "payload": payload, "created_at": self._now()}) + "\n")
 
     def load_trace(self, run_id: str) -> dict[str, Any]:
-        with self._connect() as connection:
+        with closing(self._connect()) as connection:
             run_row = connection.execute(
                 "SELECT graph_name, status, input_payload, output_payload, created_at FROM runs WHERE run_id = ?",
                 (run_id,),

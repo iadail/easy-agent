@@ -2,16 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
-import subprocess
 from abc import ABC, abstractmethod
-from typing import Any, BinaryIO, cast
+from pathlib import Path
+from typing import IO, Any, cast
 
 import httpx
 from httpx_sse import aconnect_sse
 
 from easy_agent.config import McpServerConfig
 from easy_agent.models import ToolSpec
+from easy_agent.sandbox import ProcessHandle, SandboxManager, SandboxRequest, SandboxTarget
 
 
 def _frame_message(payload: dict[str, Any]) -> bytes:
@@ -19,7 +19,8 @@ def _frame_message(payload: dict[str, Any]) -> bytes:
     return b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body
 
 
-def _read_framed_sync(stream: BinaryIO) -> dict[str, Any]:
+
+def _read_framed_sync(stream: IO[bytes]) -> dict[str, Any]:
     headers = b""
     while b"\r\n\r\n" not in headers:
         chunk = stream.read(1)
@@ -59,21 +60,23 @@ class BaseMcpClient(ABC):
 
 
 class StdioMcpClient(BaseMcpClient):
-    def __init__(self, config: McpServerConfig) -> None:
+    def __init__(self, config: McpServerConfig, sandbox_manager: SandboxManager) -> None:
         super().__init__(config)
-        self._process: subprocess.Popen[bytes] | None = None
+        self._process: ProcessHandle | None = None
         self._request_id = 0
+        self._sandbox_manager = sandbox_manager
 
     async def start(self) -> None:
         if not self.config.command:
             raise ValueError("stdio MCP transport requires a command")
-        self._process = subprocess.Popen(
-            self.config.command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=os.getcwd(),
-            env={**os.environ, **self.config.env},
+        self._process = self._sandbox_manager.start(
+            SandboxRequest(
+                command=self.config.command,
+                cwd=Path.cwd(),
+                env=self.config.env,
+                timeout_seconds=self.config.timeout_seconds,
+                target=SandboxTarget.STDIO_MCP,
+            )
         )
 
     async def _request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -89,7 +92,7 @@ class StdioMcpClient(BaseMcpClient):
             self._process.stdin.flush()
 
         await asyncio.to_thread(_write)
-        stream = cast(BinaryIO, self._process.stdout)
+        stream = self._process.stdout
         response = await asyncio.to_thread(_read_framed_sync, stream)
         return cast(dict[str, Any], response["result"])
 
@@ -165,19 +168,30 @@ class HttpSseMcpClient(BaseMcpClient):
 
 
 class McpClientManager:
-    def __init__(self, configs: list[McpServerConfig]) -> None:
+    def __init__(self, configs: list[McpServerConfig], sandbox_manager: SandboxManager) -> None:
+        self._sandbox_manager = sandbox_manager
         self._clients: dict[str, BaseMcpClient] = {}
+        self._started = False
         for config in configs:
-            if config.transport == "stdio":
-                self._clients[config.name] = StdioMcpClient(config)
-            elif config.transport == "http_sse":
-                self._clients[config.name] = HttpSseMcpClient(config)
-            else:
-                raise ValueError(f"Unsupported MCP transport: {config.transport}")
+            self.add_server(config)
+
+    def add_server(self, config: McpServerConfig) -> None:
+        client = self._build_client(config)
+        self._clients[config.name] = client
+        if self._started:
+            asyncio.run(client.start())
+
+    def _build_client(self, config: McpServerConfig) -> BaseMcpClient:
+        if config.transport == "stdio":
+            return StdioMcpClient(config, self._sandbox_manager)
+        if config.transport == "http_sse":
+            return HttpSseMcpClient(config)
+        raise ValueError(f"Unsupported MCP transport: {config.transport}")
 
     async def start(self) -> None:
         for client in self._clients.values():
             await client.start()
+        self._started = True
 
     async def list_servers(self) -> dict[str, list[ToolSpec]]:
         result: dict[str, list[ToolSpec]] = {}
@@ -191,3 +205,6 @@ class McpClientManager:
     async def aclose(self) -> None:
         for client in self._clients.values():
             await client.aclose()
+        self._started = False
+
+

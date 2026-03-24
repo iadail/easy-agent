@@ -30,6 +30,8 @@ graph:
       max_iterations: 4
   nodes: []
 
+plugins: []
+
 skills:
   - path: examples/skills
 
@@ -45,3 +47,19 @@ logging:
 security:
   allowed_commands:
     - ["cmd", "/c", "echo"]
+  sandbox:
+    mode: auto
+    targets:
+      - command_skill
+      - stdio_mcp
+    env_allowlist:
+      - PATH
+      - PATHEXT
+      - SYSTEMROOT
+      - WINDIR
+      - COMSPEC
+      - TEMP
+      - TMP
+      - DEEPSEEK_API_KEY
+    working_root: .
+    windows_sandbox_fallback: process
