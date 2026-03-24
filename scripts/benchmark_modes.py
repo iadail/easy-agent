@@ -8,7 +8,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
-from easy_agent.benchmark import run_default_suite
+from agent_runtime.benchmark import run_default_suite
 
 console = Console()
 
@@ -52,3 +52,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

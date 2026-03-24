@@ -1,0 +1,98 @@
+model:
+  provider: deepseek
+  protocol: auto
+  model: deepseek-chat
+  base_url: https://api.deepseek.com
+  api_key_env: DEEPSEEK_API_KEY
+  timeout_seconds: 60
+  max_tokens: 2048
+  temperature: 0.1
+
+graph:
+  name: longrun-base
+  entrypoint: coordinator
+  agents:
+    - name: coordinator
+      system_prompt: |
+        You are the fallback coordinator.
+      tools: []
+      sub_agents: []
+      max_iterations: 8
+  nodes: []
+
+plugins: []
+
+skills:
+  - path: skills/examples
+  - path: skills/real
+
+mcp:
+  - name: filesystem
+    transport: stdio
+    command:
+      - cmd
+      - /c
+      - npx
+      - -y
+      - '@modelcontextprotocol/server-filesystem'
+      - .easy-agent/longrun/artifacts
+  - name: redis
+    transport: stdio
+    command:
+      - uvx
+      - --from
+      - redis-mcp-server
+      - redis-mcp-server
+      - --url
+      - ${REDIS_URL}
+  - name: postgres
+    transport: stdio
+    command:
+      - cmd
+      - /c
+      - npx
+      - -y
+      - mcp-postgres-server
+    env:
+      PG_HOST: ${PG_HOST}
+      PG_PORT: ${PG_PORT}
+      PG_USER: ${PG_USER}
+      PG_PASSWORD: ${PG_PASSWORD}
+      PG_DATABASE: ${PG_DATABASE}
+
+storage:
+  path: .easy-agent/longrun/base
+  database: state.db
+
+logging:
+  level: INFO
+
+security:
+  allowed_commands:
+    - ["cmd", "/c", "echo"]
+  sandbox:
+    mode: process
+    targets:
+      - command_skill
+      - stdio_mcp
+    env_allowlist:
+      - PATH
+      - PATHEXT
+      - SYSTEMROOT
+      - WINDIR
+      - COMSPEC
+      - TEMP
+      - TMP
+      - USERPROFILE
+      - HOME
+      - APPDATA
+      - LOCALAPPDATA
+      - REDIS_URL
+      - PG_HOST
+      - PG_PORT
+      - PG_USER
+      - PG_PASSWORD
+      - PG_DATABASE
+      - DEEPSEEK_API_KEY
+    working_root: .
+    windows_sandbox_fallback: process

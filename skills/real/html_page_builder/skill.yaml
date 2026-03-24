@@ -1,0 +1,24 @@
+name: html_page_builder
+description: Create a standalone HTML page artifact from structured content.
+entry_type: python
+hook: hook.py:run
+input_schema:
+  type: object
+  properties:
+    title:
+      type: string
+    prompt:
+      type: string
+    headline:
+      type: string
+    output_path:
+      type: string
+    sections:
+      type: array
+      items:
+        type: string
+    footer:
+      type: string
+  required:
+    - output_path
+    - title

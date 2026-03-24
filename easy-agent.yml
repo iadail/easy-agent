@@ -33,7 +33,7 @@ graph:
 plugins: []
 
 skills:
-  - path: examples/skills
+  - path: skills/examples
 
 mcp: []
 
@@ -60,6 +60,10 @@ security:
       - COMSPEC
       - TEMP
       - TMP
+      - USERPROFILE
+      - HOME
+      - APPDATA
+      - LOCALAPPDATA
       - DEEPSEEK_API_KEY
     working_root: .
     windows_sandbox_fallback: process
