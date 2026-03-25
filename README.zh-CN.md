@@ -2,9 +2,7 @@
 
 [English](./README.md) | [简体中文](./README.zh-CN.md)
 
-[![Linux.do](https://linux.do/logo-128.svg)](https://linux.do/)
-
-`easy-agent` 是一个白板化、业务无关、可工程化扩展的 Python Agent 开发底座。它聚焦在运行时层，而不是某个具体业务域，因此可以把 teams、sub-agents、skills、MCP servers、plugins 以及后续协议演进挂载到同一个框架中，而不把仓库绑死在单一场景上。
+`easy-agent` 是一个白板化、业务无关、可工程化扩展的 Python Agent 开发底座。它聚焦在运行时层，而不是某个具体业务域，因此可以把 teams、sub-agents、skills、MCP servers、plugins、session memory 以及后续协议演进挂载到同一个框架中，而不把仓库绑死在单一场景上。
 
 ## 技术栈
 
@@ -32,11 +30,11 @@
       <img alt="Sandbox" src="https://img.shields.io/badge/Sandbox-process%20%7C%20windows__sandbox-374151">
     </td>
     <td valign="top" width="25%">
-      <strong>存储与质量</strong><br>
-      <img alt="SQLite" src="https://img.shields.io/badge/Storage-SQLite%20%2B%20JSONL-0EA5E9"><br>
-      <img alt="Pydantic" src="https://img.shields.io/badge/Pydantic-v2-E11D48"><br>
-      <img alt="Pytest" src="https://img.shields.io/badge/Tests-pytest-14B8A6"><br>
-      <img alt="Ruff + mypy" src="https://img.shields.io/badge/Static%20checks-Ruff%20%2B%20mypy-111827">
+      <strong>状态与质量</strong><br>
+      <img alt="Storage" src="https://img.shields.io/badge/Storage-SQLite%20%2B%20JSONL-0EA5E9"><br>
+      <img alt="Session Memory" src="https://img.shields.io/badge/Memory-session__messages%20%2B%20shared__state-0284C7"><br>
+      <img alt="Checkpoint" src="https://img.shields.io/badge/Recovery-resumable__checkpoints-16A34A"><br>
+      <img alt="Static checks" src="https://img.shields.io/badge/Checks-Ruff%20%2B%20mypy-111827">
     </td>
   </tr>
 </table>
@@ -45,14 +43,23 @@
 
 - 保持框架白板化、透明、易扩展。
 - 把 Agent 工程问题和业务逻辑解耦。
-- 用一个运行时承接 direct tools、skills、MCP、plugins、teams 和 graph workflows。
+- 用一个运行时承接 direct tools、skills、MCP、plugins、teams、session memory 和 graph workflows。
 - 在协议、编排模式、工具边界继续演进时，尽量减少重构成本。
+
+## Features
+
+- 显式、白盒的运行时分层，核心由 scheduler、orchestrator、registry、storage 和 protocol adapter 组成。
+- 面向 `OpenAI`、`Anthropic`、`Gemini` 风格载荷的统一协议适配模型调用。
+- 面向 Tool Calling 2.0 的运行时，支持 direct tools、command skills、Python hook skills、MCP tools 和 plugin mounting。
+- 支持 `single_agent`、`sub_agent`、`multi_agent_graph` 与 `Agent Teams` 协作模式。
+- 支持带显式 `session_id` 的 session-oriented memory，持久化会话消息和 graph shared state。
+- 为长流程 graph workflow 与顶层 team workflow 提供 resumable checkpoints。
+- 对 command skills 与 `stdio` MCP 提供沙盒隔离，并支持 Windows 回退处理。
+- 使用 SQLite + JSONL 持久化 trace、节点状态、运行事件、会话状态和恢复点。
 
 ## 当前架构
 
 ### 运行时拓扑
-
-说明：Mermaid 节点全部使用英文，是为了规避中文节点在部分 Mermaid 渲染器中的解析问题。
 
 ```mermaid
 flowchart LR
@@ -86,7 +93,7 @@ sequenceDiagram
     participant Model as HttpModelClient
     participant Provider as Provider API
     participant Tool as Tool or Skill or MCP
-    CLI->>Scheduler: run(input)
+    CLI->>Scheduler: run(input, session_id)
     Scheduler->>Orchestrator: dispatch entrypoint
     Orchestrator->>Model: complete(messages, tools)
     Model->>Provider: HTTP request
@@ -96,6 +103,7 @@ sequenceDiagram
     Tool-->>Orchestrator: tool result
     Orchestrator->>Model: continue with tool output
     Orchestrator-->>Scheduler: final result
+    Scheduler-->>CLI: result or resumable failure state
 ```
 
 ### 当前通信模型
@@ -103,8 +111,16 @@ sequenceDiagram
 - 模型调用统一经过 `HttpModelClient`，再由协议适配层转换为 `OpenAI`、`Anthropic` 或 `Gemini` 风格的请求载荷。
 - Skills 通过 Python hook 或本地命令包装后注册为运行时工具。
 - 当前代码中 MCP 远程通信实现是 `stdio` 和 `HTTP/SSE`。
-- 运行结果、节点状态和轨迹数据会写入 SQLite 与 JSONL trace 文件。
+- 运行轨迹、session messages、shared session state 与 checkpoints 会落到 SQLite 与 JSONL trace 文件。
 - 命令型 skill 和 `stdio` MCP 可以被沙盒隔离层包裹。
+
+## 状态、记忆与恢复
+
+- 直接 agent 和顶层 team 运行可以通过 `--session-id` 复用历史对话上下文。
+- Graph 运行会把 `shared_state` 绑定到同一个 `session_id`，后续运行可以继续使用持久化的图状态。
+- Graph checkpoints 会在图启动时创建，并在每个节点成功后继续落盘。
+- 顶层 team checkpoints 会在 team 启动时创建，并在每次完整 turn 结束后继续落盘。
+- `easy-agent resume <run_id>` 会从最近一次 checkpoint 恢复可恢复的 graph 与顶层 team 运行。
 
 ## 项目结构
 
@@ -171,7 +187,7 @@ uv sync --dev
 
 ### 本地凭据
 
-运行时现在支持本地 `.env.local` 文件。可以把机器专属凭据放进去，避免每次手动导出环境变量。
+运行时支持本地 `.env.local` 文件。可以把机器专属凭据放进去，避免每次手动导出环境变量。
 
 示例键：
 
@@ -192,6 +208,8 @@ uv run easy-agent doctor -c easy-agent.yml
 uv run easy-agent skills list -c easy-agent.yml
 uv run easy-agent plugins list -c easy-agent.yml
 uv run easy-agent teams list -c configs/teams.example.yml
+uv run easy-agent run "summarize the repository" --session-id demo-session -c easy-agent.yml
+uv run easy-agent resume <run_id> -c configs/teams.example.yml
 uv run python scripts/benchmark_modes.py --config easy-agent.yml --repeat 1
 ```
 
@@ -215,15 +233,13 @@ cmd /c scripts/windows/easy-agent.bat --help
 | `team_selector` | 1/1 | 15.1416 | 1 | 0 |
 | `team_swarm` | 1/1 | 11.0792 | 2 | 0 |
 
-## 参考官方 Agent 框架后可继续补强的方向
+## 后续仍值得继续补强的工程点
 
-当前实现是偏务实的工程底座，但参考主流官方文档后，可以很清楚地看到下一步值得补强的点：
+当前实现已经包含 durable session memory 和 resumable checkpoints，下一步更值得补强的是：
 
-- 增加 session-oriented memory，让运行时不仅保存 trace，还能保存可恢复的会话状态。
-- 为长流程 graph 和 team workflow 增加 resumable checkpoints。
 - 在工具调用前和最终输出前增加显式 guardrail hooks。
 - 增强 tracing 与 event streaming，覆盖 agent、team、tool、MCP 边界。
-- 继续保持 team orchestration 的显式建模，不把 round robin、selector、swarm 全都折叠成一个模糊循环。
+- 继续保持 team orchestration 的显式建模，而不是把多种模式折叠成一个模糊循环。
 - 在未来版本中升级远程 MCP transport，但当前文档仍然只描述仓库已经实现的通信方式。
 
 参考资料：
@@ -245,15 +261,15 @@ cmd /c scripts/windows/easy-agent.bat --help
 uv run ruff check src tests scripts
 uv run mypy src tests scripts
 uv run python -m pytest tests/unit -q
-uv run python -m pytest tests/integration/test_teams_real.py -m real -q
+uv run python -m pytest tests/integration -m real -q
 ```
 
-如果要执行完整 long-run live suite，本地 `.env.local` 或环境变量中还需要提供 PostgreSQL 与 Redis 的真实凭据。
+如果要执行完整 live suite，本地 `.env.local` 或环境变量中还需要提供 PostgreSQL 与 Redis 的真实凭据。
 
 ## 致谢
 
-- [Linux.do](https://linux.do/) 提供了开放的社区讨论与知识分享环境。
-- DeepSeek 提供了本仓库真实验证流程使用的模型端点。
+- <a href="https://linux.do/"><img alt="Linux.do" src="https://linux.do/logo-128.svg" width="20"></a> [Linux.do](https://linux.do/) 提供了开放的社区讨论与知识分享环境。
+- [![DeepSeek](https://img.shields.io/badge/DeepSeek-deepseek--chat-2563EB?style=flat-square)](https://www.deepseek.com/) 为本仓库真实验证流程提供了模型端点基线。
 
 ## License
 

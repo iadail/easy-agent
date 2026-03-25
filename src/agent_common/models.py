@@ -72,3 +72,4 @@ class RunContext:
     node_id: str | None
     shared_state: dict[str, Any] = field(default_factory=dict)
     depth: int = 0
+    session_id: str | None = None

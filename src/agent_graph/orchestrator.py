@@ -18,6 +18,18 @@ class TeamTurnResult:
     handoff_message: str | None = None
 
 
+@dataclass(slots=True)
+class AgentRunResult:
+    text: str
+    shared_messages: list[ChatMessage]
+
+
+@dataclass(slots=True)
+class TeamRunResult:
+    payload: dict[str, Any]
+    shared_messages: list[ChatMessage]
+
+
 class AgentOrchestrator:
     def __init__(
         self,
@@ -50,6 +62,7 @@ class AgentOrchestrator:
                 node_id=context.node_id,
                 shared_state=context.shared_state,
                 depth=context.depth + 1,
+                session_id=context.session_id,
             )
             return await self.run_agent(target_name, prompt, next_context)
 
@@ -82,23 +95,53 @@ class AgentOrchestrator:
         )
 
     async def run_agent(self, name: str, prompt: str, context: RunContext) -> Any:
-        if context.depth > 6:
-            raise RuntimeError('Maximum sub-agent depth exceeded')
-        shared_messages = [ChatMessage(role='user', content=prompt)]
-        result = await self._run_agent_turn(name, shared_messages, context)
+        result = await self.run_agent_with_messages(name, [ChatMessage(role='user', content=prompt)], context)
         return result.text
 
+    async def run_agent_with_messages(
+        self,
+        name: str,
+        shared_messages: list[ChatMessage],
+        context: RunContext,
+    ) -> AgentRunResult:
+        if context.depth > 6:
+            raise RuntimeError('Maximum sub-agent depth exceeded')
+        result = await self._run_agent_turn(name, list(shared_messages), context)
+        return AgentRunResult(text=result.text, shared_messages=result.shared_messages)
+
     async def run_team(self, name: str, prompt: str, context: RunContext) -> dict[str, Any]:
+        result = await self.run_team_stateful(name, prompt, context)
+        return result.payload
+
+    async def run_team_stateful(
+        self,
+        name: str,
+        prompt: str,
+        context: RunContext,
+        initial_messages: list[ChatMessage] | None = None,
+        restored_state: dict[str, Any] | None = None,
+        checkpointing: bool = False,
+    ) -> TeamRunResult:
         team = self.teams[name]
-        shared_messages = [ChatMessage(role='user', content=prompt)]
-        current_speaker = team.members[0]
-        turns: list[dict[str, Any]] = []
-        self.store.record_event(
-            context.run_id,
-            'team_start',
-            {'team': name, 'mode': team.mode.value, 'members': team.members, 'prompt': prompt},
-        )
-        for turn_index in range(1, team.max_turns + 1):
+        checkpointing = checkpointing and context.node_id is None
+        turns: list[dict[str, Any]]
+        if restored_state is not None:
+            shared_messages = self._restore_messages(restored_state.get('shared_messages', []))
+            current_speaker = str(restored_state.get('current_speaker') or team.members[0])
+            turns = [dict(turn) for turn in restored_state.get('turns', [])]
+            start_turn = int(restored_state.get('next_turn_index', 1))
+        else:
+            shared_messages = list(initial_messages) if initial_messages is not None else [ChatMessage(role='user', content=prompt)]
+            current_speaker = team.members[0]
+            turns = []
+            start_turn = 1
+            self.store.record_event(
+                context.run_id,
+                'team_start',
+                {'team': name, 'mode': team.mode.value, 'members': team.members, 'prompt': prompt},
+            )
+            self._checkpoint_team(name, prompt, context, shared_messages, turns, current_speaker, start_turn, checkpointing)
+        for turn_index in range(start_turn, team.max_turns + 1):
             if team.mode.value == 'round_robin':
                 speaker = team.members[(turn_index - 1) % len(team.members)]
             elif team.mode.value == 'selector':
@@ -151,7 +194,8 @@ class AgentOrchestrator:
                     'terminated_by': speaker,
                 }
                 self.store.record_event(context.run_id, 'team_finish', payload)
-                return payload
+                return TeamRunResult(payload=payload, shared_messages=shared_messages)
+            self._checkpoint_team(name, prompt, context, shared_messages, turns, current_speaker, turn_index + 1, checkpointing)
         raise RuntimeError(f"Team '{name}' exceeded max_turns")
 
     async def _select_speaker(
@@ -177,9 +221,9 @@ class AgentOrchestrator:
             ChatMessage(
                 role='user',
                 content=(
-                    f"Team: {team.name}\n"
+                    f'Team: {team.name}\n'
                     f"Members:\n" + '\n'.join(member_lines) + '\n\n'
-                    f"Recent transcript:\n{transcript}\n\n"
+                    f'Recent transcript:\n{transcript}\n\n'
                     f"Last speaker: {turns[-1]['speaker'] if turns else 'none'}"
                 ),
             ),
@@ -284,3 +328,35 @@ class AgentOrchestrator:
                     )
                 )
         raise RuntimeError(f"Agent '{name}' exceeded max_iterations")
+
+    def _checkpoint_team(
+        self,
+        name: str,
+        prompt: str,
+        context: RunContext,
+        shared_messages: list[ChatMessage],
+        turns: list[dict[str, Any]],
+        current_speaker: str,
+        next_turn_index: int,
+        checkpointing: bool,
+    ) -> None:
+        if not checkpointing:
+            return
+        self.store.create_checkpoint(
+            context.run_id,
+            'team',
+            {
+                'team': name,
+                'prompt': prompt,
+                'shared_messages': [message.model_dump() for message in shared_messages],
+                'turns': turns,
+                'current_speaker': current_speaker,
+                'next_turn_index': next_turn_index,
+                'shared_state': context.shared_state,
+            },
+        )
+
+    @staticmethod
+    def _restore_messages(payloads: list[dict[str, Any]]) -> list[ChatMessage]:
+        return [ChatMessage.model_validate(item) for item in payloads]
+

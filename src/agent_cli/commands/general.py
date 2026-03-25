@@ -97,9 +97,21 @@ def register(app: typer.Typer) -> None:
     def run(
         input_text: str = typer.Argument(..., help='Input text for the graph, entry agent, or entry team.'),
         config: str = typer.Option('easy-agent.yml', '-c', '--config'),
+        session_id: str | None = typer.Option(None, '--session-id', help='Optional explicit session id for persistent memory.'),
     ) -> None:
         async def _run(runtime: EasyAgentRuntime) -> None:
-            result = await runtime.run(input_text)
+            result = await runtime.run(input_text, session_id=session_id)
+            console.print_json(json.dumps(result, ensure_ascii=False))
+
+        asyncio.run(with_runtime(config, _run))
+
+    @app.command()
+    def resume(
+        run_id: str = typer.Argument(..., help='Existing run id to resume from the latest checkpoint.'),
+        config: str = typer.Option('easy-agent.yml', '-c', '--config'),
+    ) -> None:
+        async def _run(runtime: EasyAgentRuntime) -> None:
+            result = await runtime.resume(run_id)
             console.print_json(json.dumps(result, ensure_ascii=False))
 
         asyncio.run(with_runtime(config, _run))

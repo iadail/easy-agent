@@ -2,9 +2,7 @@
 
 [English](./README.md) | [简体中文](./README.zh-CN.md)
 
-[![Linux.do](https://linux.do/logo-128.svg)](https://linux.do/)
-
-`easy-agent` is a white-box, business-agnostic, extensible agent engineering foundation for Python. It focuses on the runtime layer instead of domain logic, so teams, sub-agents, skills, MCP servers, plugins, and future protocol changes can be mounted without coupling the framework to a specific product.
+`easy-agent` is a white-box, business-agnostic, extensible agent engineering foundation for Python. It focuses on the runtime layer instead of domain logic, so teams, sub-agents, skills, MCP servers, plugins, session memory, and future protocol changes can be mounted without coupling the framework to a specific product.
 
 ## Tech Stack
 
@@ -32,11 +30,11 @@
       <img alt="Sandbox" src="https://img.shields.io/badge/Sandbox-process%20%7C%20windows__sandbox-374151">
     </td>
     <td valign="top" width="25%">
-      <strong>Storage & Quality</strong><br>
-      <img alt="SQLite" src="https://img.shields.io/badge/Storage-SQLite%20%2B%20JSONL-0EA5E9"><br>
-      <img alt="Pydantic" src="https://img.shields.io/badge/Pydantic-v2-E11D48"><br>
-      <img alt="Pytest" src="https://img.shields.io/badge/Tests-pytest-14B8A6"><br>
-      <img alt="Ruff + mypy" src="https://img.shields.io/badge/Static%20checks-Ruff%20%2B%20mypy-111827">
+      <strong>State & Quality</strong><br>
+      <img alt="Storage" src="https://img.shields.io/badge/Storage-SQLite%20%2B%20JSONL-0EA5E9"><br>
+      <img alt="Session Memory" src="https://img.shields.io/badge/Memory-session__messages%20%2B%20shared__state-0284C7"><br>
+      <img alt="Checkpoint" src="https://img.shields.io/badge/Recovery-resumable__checkpoints-16A34A"><br>
+      <img alt="Static checks" src="https://img.shields.io/badge/Checks-Ruff%20%2B%20mypy-111827">
     </td>
   </tr>
 </table>
@@ -45,8 +43,19 @@
 
 - Keep the framework white-box and easy to extend.
 - Separate agent engineering concerns from business logic.
-- Provide one runtime that can host direct tools, skills, MCP, plugins, teams, and graph workflows.
+- Provide one runtime that can host direct tools, skills, MCP, plugins, teams, session memory, and graph workflows.
 - Keep the design easy to evolve as protocols and agent patterns improve.
+
+## Features
+
+- White-box runtime assembly with explicit scheduler, orchestrator, registry, storage, and protocol layers.
+- Protocol-adapted model requests for `OpenAI`, `Anthropic`, and `Gemini` style payloads.
+- Tool Calling 2.0 oriented runtime with direct tools, command skills, Python hook skills, MCP tools, and plugin mounting.
+- `single_agent`, `sub_agent`, `multi_agent_graph`, and `Agent Teams` collaboration modes.
+- Session-oriented memory with explicit `session_id` support for durable message history and shared graph state.
+- Resumable checkpoints for long-running graph workflows and top-level team workflows.
+- Sandboxed execution for command skills and `stdio` MCP with Windows fallback handling.
+- SQLite + JSONL trace persistence plus structured node and runtime events.
 
 ## Current Architecture
 
@@ -84,7 +93,7 @@ sequenceDiagram
     participant Model as HttpModelClient
     participant Provider as Provider API
     participant Tool as Tool or Skill or MCP
-    CLI->>Scheduler: run(input)
+    CLI->>Scheduler: run(input, session_id)
     Scheduler->>Orchestrator: dispatch entrypoint
     Orchestrator->>Model: complete(messages, tools)
     Model->>Provider: HTTP request
@@ -94,6 +103,7 @@ sequenceDiagram
     Tool-->>Orchestrator: tool result
     Orchestrator->>Model: continue with tool output
     Orchestrator-->>Scheduler: final result
+    Scheduler-->>CLI: result or resumable failure state
 ```
 
 ### Current Communication Model
@@ -101,8 +111,16 @@ sequenceDiagram
 - Model calls go through `HttpModelClient`, then through a protocol adapter for `OpenAI`, `Anthropic`, or `Gemini` style payloads.
 - Skills register as runtime tools through Python hooks or local command wrappers.
 - MCP communication currently supports `stdio` and `HTTP/SSE` in the implemented codebase.
-- Runtime traces and node results are persisted into SQLite plus JSONL trace files.
+- Runtime traces, session messages, shared session state, and checkpoints are persisted into SQLite plus JSONL trace files.
 - Sandboxing is applied around command skills and `stdio` MCP where configured.
+
+## State, Memory, and Recovery
+
+- Direct agent and top-level team runs can reuse prior conversation context by passing `--session-id`.
+- Graph runs persist `shared_state` under the same `session_id`, so later runs can continue from durable graph context.
+- Graph checkpoints are created at graph start and after each successful node.
+- Top-level team checkpoints are created at team start and after each completed turn.
+- `easy-agent resume <run_id>` restores the latest checkpoint for resumable graph and top-level team runs.
 
 ## Project Layout
 
@@ -169,7 +187,7 @@ uv sync --dev
 
 ### Local Credentials
 
-The runtime now supports a local-only `.env.local` file. Use it for machine-specific secrets so you do not need to export environment variables every time.
+The runtime supports a local-only `.env.local` file. Use it for machine-specific secrets so you do not need to export environment variables every time.
 
 Example keys:
 
@@ -190,6 +208,8 @@ uv run easy-agent doctor -c easy-agent.yml
 uv run easy-agent skills list -c easy-agent.yml
 uv run easy-agent plugins list -c easy-agent.yml
 uv run easy-agent teams list -c configs/teams.example.yml
+uv run easy-agent run "summarize the repository" --session-id demo-session -c easy-agent.yml
+uv run easy-agent resume <run_id> -c configs/teams.example.yml
 uv run python scripts/benchmark_modes.py --config easy-agent.yml --repeat 1
 ```
 
@@ -213,15 +233,13 @@ The current live benchmark baseline comes from `.easy-agent/benchmark-report.jso
 | `team_selector` | 1/1 | 15.1416 | 1 | 0 |
 | `team_swarm` | 1/1 | 11.0792 | 2 | 0 |
 
-## Design Improvements Inspired by Official Agent Frameworks
+## Future Engineering Improvements
 
-The current implementation is intentionally pragmatic, but the next useful upgrades are clear when compared with official agent framework documentation:
+The current implementation now includes durable session memory and resumable checkpoints. The next useful upgrades are:
 
-- Add session-oriented memory so a run can keep durable conversational state instead of only storing traces.
-- Add resumable checkpoints for long-running graph and team workflows.
 - Add explicit guardrail hooks before tool execution and before final output emission.
 - Add richer tracing and event streaming across agent, team, tool, and MCP boundaries.
-- Keep team orchestration patterns explicit and typed, instead of hiding them behind one generic loop.
+- Keep team orchestration patterns explicit and typed instead of hiding them behind one generic loop.
 - Modernize remote MCP transport in a future round while keeping the current implementation truthful in docs today.
 
 Reference material:
@@ -243,15 +261,15 @@ Reference material:
 uv run ruff check src tests scripts
 uv run mypy src tests scripts
 uv run python -m pytest tests/unit -q
-uv run python -m pytest tests/integration/test_teams_real.py -m real -q
+uv run python -m pytest tests/integration -m real -q
 ```
 
-For the full long-run live suite, local PostgreSQL and Redis credentials must be available in `.env.local` or environment variables.
+For the full live suite, local PostgreSQL and Redis credentials must be available in `.env.local` or environment variables.
 
 ## Acknowledgements
 
-- [Linux.do](https://linux.do/) for community discussion and open knowledge sharing.
-- DeepSeek for the model endpoint used in real verification.
+- <a href="https://linux.do/"><img alt="Linux.do" src="https://linux.do/logo-128.svg" width="20"></a> [Linux.do](https://linux.do/) for community discussion and open knowledge sharing.
+- [![DeepSeek](https://img.shields.io/badge/DeepSeek-deepseek--chat-2563EB?style=flat-square)](https://www.deepseek.com/) for the real verification baseline and model endpoint.
 
 ## License
 

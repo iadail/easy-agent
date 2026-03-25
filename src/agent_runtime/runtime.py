@@ -98,17 +98,22 @@ class EasyAgentRuntime:
                 self.registry.register(
                     ToolSpec(
                         name=registry_name,
-                        description=f"MCP tool {server_name}/{tool.name}: {tool.description}",
+                        description=f'MCP tool {server_name}/{tool.name}: {tool.description}',
                         input_schema=tool.input_schema,
                     ),
                     _handler,
                 )
                 self._bound_mcp_tools.add(registry_name)
 
-    async def run(self, input_text: str) -> dict[str, Any]:
+    async def run(self, input_text: str, session_id: str | None = None) -> dict[str, Any]:
         if not self._started:
             await self.start()
-        return await self.scheduler.run(input_text)
+        return await self.scheduler.run(input_text, session_id=session_id)
+
+    async def resume(self, run_id: str) -> dict[str, Any]:
+        if not self._started:
+            await self.start()
+        return await self.scheduler.resume(run_id)
 
     async def aclose(self) -> None:
         await self.mcp_manager.aclose()
@@ -144,4 +149,3 @@ def build_runtime_from_config(config: AppConfig) -> EasyAgentRuntime:
 
 def build_runtime(config_path: str | Path) -> EasyAgentRuntime:
     return build_runtime_from_config(load_config(config_path))
-

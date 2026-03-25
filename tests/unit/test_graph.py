@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -25,11 +28,23 @@ class StubModelClient:
         self.calls += 1
         if self.calls == 1:
             return AssistantResponse(
-                text="",
-                tool_calls=[ToolCall(id="1", name="python_echo", arguments={"prompt": "from-tool"})],
+                text='',
+                tool_calls=[ToolCall(id='1', name='python_echo', arguments={'prompt': 'from-tool'})],
                 protocol=Protocol.OPENAI,
             )
-        return AssistantResponse(text="done", protocol=Protocol.OPENAI)
+        return AssistantResponse(text='done', protocol=Protocol.OPENAI)
+
+    async def aclose(self) -> None:
+        return None
+
+
+class SessionAwareModelClient:
+    async def complete(self, messages: list[ChatMessage], tools: list[ToolSpec]) -> AssistantResponse:
+        del tools
+        transcript = '\n'.join(f'{message.role}:{message.content}' for message in messages)
+        if 'first-session-input' in transcript and messages[-1].content == 'second-session-input':
+            return AssistantResponse(text='reused-session', protocol=Protocol.OPENAI)
+        return AssistantResponse(text='fresh-session', protocol=Protocol.OPENAI)
 
     async def aclose(self) -> None:
         return None
@@ -37,90 +52,190 @@ class StubModelClient:
 
 class DummyMcpManager:
     async def call_tool(self, server_name: str, tool_name: str, arguments: dict[str, str]) -> dict[str, str]:
-        return {"server": server_name, "tool": tool_name, **arguments}
+        return {'server': server_name, 'tool': tool_name, **arguments}
 
 
 @pytest.mark.asyncio
 async def test_graph_scheduler_runs_agent_with_tool_loop(tmp_path: Path) -> None:
     config = AppConfig.model_validate(
         {
-            "model": ModelConfig().model_dump(),
-            "graph": {
-                "entrypoint": "coordinator",
-                "agents": [
+            'model': ModelConfig().model_dump(),
+            'graph': {
+                'entrypoint': 'coordinator',
+                'agents': [
                     {
-                        "name": "coordinator",
-                        "system_prompt": "system",
-                        "tools": ["python_echo"],
-                        "sub_agents": [],
+                        'name': 'coordinator',
+                        'system_prompt': 'system',
+                        'tools': ['python_echo'],
+                        'sub_agents': [],
                     }
                 ],
-                "nodes": [],
+                'nodes': [],
             },
-            "skills": [],
-            "mcp": [],
-            "storage": {"path": str(tmp_path), "database": "state.db"},
-            "security": {"allowed_commands": [["cmd", "/c", "echo"]]},
+            'skills': [],
+            'mcp': [],
+            'storage': {'path': str(tmp_path), 'database': 'state.db'},
+            'security': {'allowed_commands': [['cmd', '/c', 'echo']]},
         }
     )
     registry = ToolRegistry()
     registry.register(
-        ToolSpec(name="python_echo", description="Echo", input_schema={"type": "object"}),
-        lambda arguments, context: {"echo": arguments["prompt"], "run_id": context.run_id},
+        ToolSpec(name='python_echo', description='Echo', input_schema={'type': 'object'}),
+        lambda arguments, context: {'echo': arguments['prompt'], 'run_id': context.run_id},
     )
-    store = SQLiteRunStore(tmp_path, "state.db")
+    store = SQLiteRunStore(tmp_path, 'state.db')
     model_client = StubModelClient()
     orchestrator = AgentOrchestrator(config, model_client, registry, store)
     scheduler = GraphScheduler(config, registry, orchestrator, store, DummyMcpManager())
 
-    result = await scheduler.run("hello")
+    result = await scheduler.run('hello')
 
-    assert result["result"] == "done"
+    assert result['result'] == 'done'
 
 
 @pytest.mark.asyncio
 async def test_graph_scheduler_retries_failed_nodes(tmp_path: Path) -> None:
-    attempts = {"count": 0}
+    attempts = {'count': 0}
     config = AppConfig.model_validate(
         {
-            "model": ModelConfig().model_dump(),
-            "graph": {
-                "entrypoint": "prepare",
-                "agents": [],
-                "nodes": [
+            'model': ModelConfig().model_dump(),
+            'graph': {
+                'entrypoint': 'prepare',
+                'agents': [],
+                'nodes': [
                     {
-                        "id": "prepare",
-                        "type": "skill",
-                        "target": "flaky",
-                        "retries": 1,
-                        "timeout_seconds": 5,
+                        'id': 'prepare',
+                        'type': 'skill',
+                        'target': 'flaky',
+                        'retries': 1,
+                        'timeout_seconds': 5,
                     }
                 ],
             },
-            "skills": [],
-            "mcp": [],
-            "storage": {"path": str(tmp_path), "database": "state.db"},
-            "security": {"allowed_commands": []},
+            'skills': [],
+            'mcp': [],
+            'storage': {'path': str(tmp_path), 'database': 'state.db'},
+            'security': {'allowed_commands': []},
         }
     )
     registry = ToolRegistry()
 
     async def flaky(arguments: dict[str, str], context: RunContext) -> str:
         del arguments, context
-        attempts["count"] += 1
-        if attempts["count"] == 1:
-            raise RuntimeError("boom")
-        return "ok"
+        attempts['count'] += 1
+        if attempts['count'] == 1:
+            raise RuntimeError('boom')
+        return 'ok'
 
-    registry.register(ToolSpec(name="flaky", description="Retry me", input_schema={"type": "object"}), flaky)
-    store = SQLiteRunStore(tmp_path, "state.db")
+    registry.register(ToolSpec(name='flaky', description='Retry me', input_schema={'type': 'object'}), flaky)
+    store = SQLiteRunStore(tmp_path, 'state.db')
     model_client = StubModelClient()
     orchestrator = AgentOrchestrator(config, model_client, registry, store)
     scheduler = GraphScheduler(config, registry, orchestrator, store, DummyMcpManager())
 
-    result = await scheduler.run("hello")
+    result = await scheduler.run('hello')
 
-    assert result["result"] == "ok"
-    assert attempts["count"] == 2
+    assert result['result'] == 'ok'
+    assert attempts['count'] == 2
 
 
+@pytest.mark.asyncio
+async def test_direct_agent_run_reuses_explicit_session_memory(tmp_path: Path) -> None:
+    config = AppConfig.model_validate(
+        {
+            'model': ModelConfig().model_dump(),
+            'graph': {
+                'entrypoint': 'coordinator',
+                'agents': [{'name': 'coordinator', 'system_prompt': 'system', 'tools': [], 'sub_agents': []}],
+                'teams': [],
+                'nodes': [],
+            },
+            'skills': [],
+            'mcp': [],
+            'storage': {'path': str(tmp_path), 'database': 'state.db'},
+            'security': {'allowed_commands': []},
+        }
+    )
+    registry = ToolRegistry()
+    store = SQLiteRunStore(tmp_path, 'state.db')
+    model_client = SessionAwareModelClient()
+    orchestrator = AgentOrchestrator(config, model_client, registry, store)
+    scheduler = GraphScheduler(config, registry, orchestrator, store, DummyMcpManager())
+
+    first = await scheduler.run('first-session-input', session_id='session-a')
+    second = await scheduler.run('second-session-input', session_id='session-a')
+
+    assert first['result'] == 'fresh-session'
+    assert second['result'] == 'reused-session'
+    assert second['session_id'] == 'session-a'
+
+
+@pytest.mark.asyncio
+async def test_graph_scheduler_resumes_from_checkpoint_without_rerunning_completed_nodes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    counts = {'prepare': 0, 'review': 0}
+    config = AppConfig.model_validate(
+        {
+            'model': ModelConfig().model_dump(),
+            'graph': {
+                'entrypoint': 'aggregate',
+                'agents': [],
+                'nodes': [
+                    {
+                        'id': 'prepare',
+                        'type': 'skill',
+                        'target': 'prepare',
+                    },
+                    {
+                        'id': 'review',
+                        'type': 'skill',
+                        'target': 'review',
+                        'deps': ['prepare'],
+                        'input_template': 'use prior {prepare}',
+                    },
+                    {
+                        'id': 'aggregate',
+                        'type': 'join',
+                        'deps': ['prepare', 'review'],
+                    },
+                ],
+            },
+            'skills': [],
+            'mcp': [],
+            'storage': {'path': str(tmp_path), 'database': 'state.db'},
+            'security': {'allowed_commands': []},
+        }
+    )
+    registry = ToolRegistry()
+
+    async def prepare(arguments: dict[str, str], context: RunContext) -> dict[str, str]:
+        del arguments, context
+        counts['prepare'] += 1
+        return {'step': 'prepare'}
+
+    async def review(arguments: dict[str, str], context: RunContext) -> dict[str, str]:
+        counts['review'] += 1
+        if counts['review'] == 1:
+            raise RuntimeError('review failed once')
+        return {'step': 'review', 'from': context.shared_state['prepare']['step']}
+
+    registry.register(ToolSpec(name='prepare', description='prepare', input_schema={'type': 'object'}), prepare)
+    registry.register(ToolSpec(name='review', description='review', input_schema={'type': 'object'}), review)
+    store = SQLiteRunStore(tmp_path, 'state.db')
+    model_client = StubModelClient()
+    orchestrator = AgentOrchestrator(config, model_client, registry, store)
+    scheduler = GraphScheduler(config, registry, orchestrator, store, DummyMcpManager())
+    monkeypatch.setattr('agent_graph.scheduler.uuid.uuid4', lambda: SimpleNamespace(hex='graph-resume-run'))
+
+    with pytest.raises(RuntimeError, match='Run graph-resume-run failed'):
+        await scheduler.run('graph-input')
+
+    resumed = await scheduler.resume('graph-resume-run')
+    trace = store.load_trace('graph-resume-run')
+
+    assert resumed['result']['review']['step'] == 'review'
+    assert counts['prepare'] == 1
+    assert counts['review'] == 2
+    assert any(event['kind'] == 'run_resumed' for event in trace['events'])

@@ -10,10 +10,14 @@ from agent_integrations.storage import SQLiteRunStore
 
 
 class TeamModelClient:
+    def __init__(self, fail_closer_once: bool = False) -> None:
+        self.fail_closer_once = fail_closer_once
+        self.closer_failures = 0
+
     async def complete(self, messages: list[ChatMessage], tools: list[ToolSpec]) -> AssistantResponse:
         system = messages[0].content if messages else ''
         tool_names = [tool.name for tool in tools]
-        has_tool_result = any(message.role == 'tool' for message in messages)
+        has_tool_result = bool(messages) and messages[-1].role == 'tool'
         selector_call = not tools and 'Members:' in (messages[-1].content if messages else '')
         if selector_call:
             transcript = messages[-1].content
@@ -65,6 +69,9 @@ class TeamModelClient:
         if 'do not terminate' in system and has_tool_result:
             return AssistantResponse(text='planner ready', protocol=Protocol.OPENAI)
         if 'end with TERMINATE' in system and not has_tool_result:
+            if self.fail_closer_once and self.closer_failures == 0:
+                self.closer_failures += 1
+                raise RuntimeError('closer failed once')
             return AssistantResponse(
                 text='',
                 tool_calls=[ToolCall(id='close-1', name='python_echo', arguments={'prompt': 'team-close'})],
@@ -83,7 +90,11 @@ class DummyMcpManager:
         return {'server': server_name, 'tool': tool_name, **arguments}
 
 
-def build_scheduler(tmp_path: Path, graph_payload: dict[str, object]) -> GraphScheduler:
+def build_scheduler(
+    tmp_path: Path,
+    graph_payload: dict[str, object],
+    model_client: TeamModelClient | None = None,
+) -> GraphScheduler:
     config = AppConfig.model_validate(
         {
             'model': ModelConfig().model_dump(),
@@ -100,8 +111,8 @@ def build_scheduler(tmp_path: Path, graph_payload: dict[str, object]) -> GraphSc
         lambda arguments, context: {'echo': arguments['prompt'], 'run_id': context.run_id},
     )
     store = SQLiteRunStore(tmp_path, 'state.db')
-    model_client = TeamModelClient()
-    orchestrator = AgentOrchestrator(config, model_client, registry, store)
+    client = model_client or TeamModelClient()
+    orchestrator = AgentOrchestrator(config, client, registry, store)
     orchestrator.register_subagent_tools()
     return GraphScheduler(config, registry, orchestrator, store, DummyMcpManager())
 
@@ -139,6 +150,48 @@ async def test_round_robin_team_runs_and_terminates(tmp_path: Path) -> None:
     assert result['result']['terminated_by'] == 'closer'
     assert [turn['speaker'] for turn in result['result']['turns']] == ['planner', 'closer']
     assert any(event['kind'] == 'team_finish' for event in trace['events'])
+
+
+@pytest.mark.asyncio
+async def test_round_robin_team_resume_skips_completed_turns(tmp_path: Path) -> None:
+    scheduler = build_scheduler(
+        tmp_path,
+        {
+            'entrypoint': 'round_robin_team',
+            'agents': [
+                {
+                    'name': 'planner',
+                    'description': 'Plans the work.',
+                    'system_prompt': 'Use python_echo exactly once, summarize the task, and do not terminate.',
+                    'tools': ['python_echo'],
+                },
+                {
+                    'name': 'closer',
+                    'description': 'Closes the work.',
+                    'system_prompt': 'Use python_echo exactly once, summarize the closure, and end with TERMINATE.',
+                    'tools': ['python_echo'],
+                },
+            ],
+            'teams': [
+                {'name': 'round_robin_team', 'mode': 'round_robin', 'members': ['planner', 'closer'], 'max_turns': 4}
+            ],
+            'nodes': [],
+        },
+        model_client=TeamModelClient(fail_closer_once=True),
+    )
+
+    with pytest.raises(RuntimeError, match='failed') as exc_info:
+        await scheduler.run('team task')
+
+    run_id = str(exc_info.value).split()[1]
+    resumed = await scheduler.resume(run_id)
+    trace = scheduler.store.load_trace(run_id)
+    team_turn_events = [event for event in trace['events'] if event['kind'] == 'team_turn']
+
+    assert resumed['result']['terminated_by'] == 'closer'
+    assert [event['payload']['speaker'] for event in team_turn_events].count('planner') == 1
+    assert [event['payload']['speaker'] for event in team_turn_events].count('closer') == 2
+    assert any(event['kind'] == 'run_resumed' for event in trace['events'])
 
 
 @pytest.mark.asyncio
@@ -252,3 +305,4 @@ async def test_team_node_dispatches_inside_graph(tmp_path: Path) -> None:
     result = await scheduler.run('graph team task')
 
     assert result['result']['terminated_by'] == 'closer'
+
