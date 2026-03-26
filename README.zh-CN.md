@@ -14,7 +14,7 @@
 
 - 把运行时工程和业务逻辑彻底拆开。
 - 把调度、编排、状态、协议适配这些能力保留为白盒，而不是藏进黑盒抽象。
-- 让 tools、skills、MCP servers、plugins 可以继续挂载，而不是每次都重写核心。
+- 让 tools、skills、MCP servers、plugins 可以继续挂载，而不是每次都重写核心能力。
 - 让长任务有真正的 harness，而不是继续堆一个更大的 prompt。
 
 ## 适合谁用
@@ -26,8 +26,8 @@
 ## 你能直接得到什么
 
 - 一套显式的 `scheduler`、`orchestrator`、`registry`、`storage`、`protocol adapter` 运行时分层。
-- 一套同时支持 `single_agent`、`sub_agent`、graph workflow 和 `Agent Teams` 的运行时。
-- 一个真正的一等公民长任务 harness：`initializer -> worker -> evaluator`，支持可恢复 checkpoint 和持久化工件。
+- 一套同时支持 `single_agent`、`sub_agent`、graph workflows 和 `Agent Teams` 的运行时。
+- 一个真正的一等公民长任务 harness：`initializer -> worker -> evaluator`，支持可恢复 checkpoints 和持久化工件。
 - 面向 `OpenAI`、`Anthropic`、`Gemini` 风格载荷的统一模型调用适配层。
 - 面向 Tool Calling 2.0 的统一执行层，能承接 direct tools、command skills、Python hook skills、MCP tools 和 plugin mounting。
 - 内置 session memory、event streaming、tracing、guardrails 和 public evaluation 工具。
@@ -67,13 +67,13 @@
   </tr>
 </table>
 
-## Features
+## 能力一览
 
 - 显式运行时分层，核心保留 `scheduler`、`orchestrator`、`registry`、`storage`、`protocol adapter` 等白盒能力。
 - 统一适配 `OpenAI`、`Anthropic`、`Gemini` 风格的模型请求与响应。
-- Tool Calling 2.0 运行时可同时承接 direct tools、command skills、Python hook skills、MCP tools 和 plugins。
+- Tool Calling 2.0 运行时可同时承接 direct tools、command skills、Python hook skills、MCP tools 和 mounted plugins。
 - 支持 `single_agent`、`sub_agent`、`multi_agent_graph`、`Agent Teams` 多种协作模式。
-- 增加了一等公民的长任务 harness，具备持久化工件、显式 completion contract、evaluator 驱动的 continue 或 replan，以及 resumable checkpoints。
+- 增加了一等公民的长任务 harness，具备持久化工件、显式 completion contract、由 evaluator 驱动的 continue 或 replan，以及 resumable checkpoints。
 - 对直接运行、顶层 team 运行、harness 状态复用提供 session-oriented memory。
 - 在工具执行前和最终输出前都有显式 guardrail hooks。
 - 对模型输出的工具参数做 schema-aware validation，并提供 repair loop。
@@ -85,10 +85,10 @@
 
 这个运行时刻意保持白盒。关键层次是可以看见、可以替换、可以测试的。
 
-- `scheduler` 负责 direct-agent 和 graph workflow 的调度。
+- `scheduler` 负责 direct-agent 和 graph workflows 的调度。
 - `harness` 负责长任务的 initializer、worker、evaluator 循环。
 - `orchestrator` 负责 agent turn 和 team turn 的执行。
-- `registry` 负责统一暴露 direct tools、skills、MCP tools 和 plugin tools。
+- `registry` 负责统一暴露 direct tools、skills、MCP tools 和 mounted plugin tools。
 - `storage` 负责持久化 runs、traces、checkpoints、session state、harness state。
 - `protocol adapters` 负责把不同模型厂商的请求和响应统一到同一个运行时接口上。
 
@@ -134,7 +134,7 @@ flowchart LR
 
 - `bootstrap.md`：给人看的启动与恢复说明
 - `progress.md`：按 cycle 记录的进度日志
-- `features.json`：给程序读的结构化状态、决策和计数器
+- `features.json`：给程序读取的结构化状态、决策和计数器
 
 ### Harness Loop
 
@@ -149,13 +149,13 @@ flowchart TD
     Eval -->|COMPLETE| Finish[Finish Run]
 ```
 
-这部分设计参考了 Anthropic 在 2025-11-26 发布的文章 [Effective harnesses for long-running agents](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents)。核心思想很直接：长任务真正需要的是显式协调代码、清晰的完成判定和可恢复工件，而不是只换一个更强的模型。
+这部分设计参考了 Anthropic 于 2025-11-26 发布的文章 [Effective harnesses for long-running agents](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents)。核心思想很直接：长任务真正需要的是显式协调代码、清晰的完成判定和可恢复工件，而不是只换一个更强的模型。
 
 ## 协议与工具模型
 
 ### 模型协议
 
-- `OpenAI` 风格载荷，也包括 DeepSeek 这类 OpenAI-compatible 路径。
+- `OpenAI` 风格载荷，也包括 DeepSeek 这类 OpenAI-compatible 接口路径。
 - `Anthropic` 风格载荷。
 - `Gemini` 风格载荷。
 
