@@ -2,7 +2,35 @@
 
 [English](./README.md) | [简体中文](./README.zh-CN.md)
 
-`easy-agent` is a white-box, business-agnostic, extensible Python foundation for building agents. It focuses on runtime engineering instead of domain logic, so teams, sub-agents, skills, MCP servers, plugins, session memory, and future protocol changes can be mounted without coupling the framework to a single product.
+`easy-agent` is a white-box Python foundation for building agent systems that you can actually inspect, test, and extend.
+
+It is not a business-specific app. It is the runtime layer underneath one. The project gives you a stable place to run single agents, sub-agents, multi-agent graphs, teams, tools, skills, MCP servers, plugins, and now long-running harnesses without hard-coding product logic into the framework.
+
+## What This Project Is
+
+Many agent repositories jump straight from "call a model" to "ship a product". That makes the middle messy: tool calling drifts, long tasks become prompt soup, state is hard to resume, and protocol changes leak into business code.
+
+`easy-agent` exists to keep that middle layer explicit.
+
+- It separates runtime engineering from business logic.
+- It keeps orchestration visible instead of hiding it behind opaque abstractions.
+- It lets you mount new tools, skills, MCP servers, and plugins without rewriting the core.
+- It gives long-running work a real harness instead of relying on one giant prompt.
+
+## Who It Is For
+
+- Teams building agent products that need a reusable runtime, not a one-off demo.
+- Engineers who want direct control over scheduling, tools, state, and protocol adaptation.
+- Projects that need to evolve with provider APIs, tool schemas, MCP, or multi-agent patterns over time.
+
+## What You Get
+
+- A white-box runtime with explicit `scheduler`, `orchestrator`, `registry`, `storage`, and `protocol adapter` layers.
+- One runtime for `single_agent`, `sub_agent`, graph workflows, and `Agent Teams`.
+- A first-class long-running harness with `initializer -> worker -> evaluator` loops, resumable checkpoints, and durable artifacts.
+- A unified model-call surface for `OpenAI`, `Anthropic`, and `Gemini` style payloads.
+- A Tool Calling 2.0 runtime that can host direct tools, command skills, Python hook skills, MCP tools, and mounted plugins.
+- Built-in session memory, tracing, event streaming, guardrails, and public evaluation helpers.
 
 ## Tech Stack
 
@@ -16,124 +44,130 @@
       <img alt="Typer" src="https://img.shields.io/badge/Typer-CLI-059669">
     </td>
     <td valign="top" width="25%">
-      <strong>Agent Core</strong><br>
+      <strong>Model Layer</strong><br>
       <img alt="Protocols" src="https://img.shields.io/badge/Protocols-OpenAI%20%7C%20Anthropic%20%7C%20Gemini-2563EB"><br>
-      <img alt="Teams" src="https://img.shields.io/badge/Teams-round__robin%20%7C%20selector%20%7C%20swarm-7C3AED"><br>
-      <img alt="Graph" src="https://img.shields.io/badge/Graph-DAG%20scheduler-9333EA"><br>
-      <img alt="Tools" src="https://img.shields.io/badge/Tools-tool%20calling%202.0-1D4ED8">
+      <img alt="Client" src="https://img.shields.io/badge/Client-HTTP%20model%20adapter-1D4ED8"><br>
+      <img alt="Guardrails" src="https://img.shields.io/badge/Guardrails-tool%20input%20%2B%20final%20output-DC2626"><br>
+      <img alt="Streaming" src="https://img.shields.io/badge/Streaming-runtime%20events-0284C7">
+    </td>
+    <td valign="top" width="25%">
+      <strong>Execution</strong><br>
+      <img alt="Modes" src="https://img.shields.io/badge/Modes-single%20%7C%20sub%20%7C%20graph%20%7C%20teams-7C3AED"><br>
+      <img alt="Harness" src="https://img.shields.io/badge/Harness-initializer%20worker%20evaluator-F59E0B"><br>
+      <img alt="Teams" src="https://img.shields.io/badge/Teams-round__robin%20%7C%20selector%20%7C%20swarm-9333EA"><br>
+      <img alt="Recovery" src="https://img.shields.io/badge/Recovery-session%20memory%20%2B%20checkpoints-16A34A">
     </td>
     <td valign="top" width="25%">
       <strong>Integration</strong><br>
-      <img alt="Skills" src="https://img.shields.io/badge/Skills-Python%20hook%20%7C%20command-F59E0B"><br>
+      <img alt="Tools" src="https://img.shields.io/badge/Tools-direct%20tools-0891B2"><br>
+      <img alt="Skills" src="https://img.shields.io/badge/Skills-command%20%7C%20Python%20hook-F97316"><br>
       <img alt="MCP" src="https://img.shields.io/badge/MCP-stdio%20%7C%20HTTP%2FSSE-DC2626"><br>
-      <img alt="Plugins" src="https://img.shields.io/badge/Plugins-path%20%7C%20manifest%20%7C%20entry%20point-0891B2"><br>
-      <img alt="Sandbox" src="https://img.shields.io/badge/Sandbox-process%20%7C%20windows__sandbox-374151">
-    </td>
-    <td valign="top" width="25%">
-      <strong>State & Observability</strong><br>
-      <img alt="Storage" src="https://img.shields.io/badge/Storage-SQLite%20%2B%20JSONL-0EA5E9"><br>
-      <img alt="Guardrails" src="https://img.shields.io/badge/Guardrails-tool__input%20%2B%20final__output-DC2626"><br>
-      <img alt="Streaming" src="https://img.shields.io/badge/Streaming-runtime__events-0284C7"><br>
-      <img alt="Recovery" src="https://img.shields.io/badge/Recovery-session__memory%20%2B%20checkpoints-16A34A">
+      <img alt="Plugins" src="https://img.shields.io/badge/Plugins-path%20%7C%20manifest%20%7C%20entry%20point-0EA5E9">
     </td>
   </tr>
 </table>
 
-## Why This Project Exists
-
-- Keep agent infrastructure white-box and easy to extend.
-- Separate agent engineering concerns from business logic.
-- Provide one runtime that can host direct tools, skills, MCP, plugins, teams, session memory, and graph workflows.
-- Keep the runtime easy to evolve as protocols, tool schemas, and orchestration patterns improve.
-
 ## Features
 
-- White-box runtime assembly with explicit scheduler, orchestrator, registry, storage, guardrail, and protocol layers.
-- Protocol-adapted model requests for `OpenAI`, `Anthropic`, and `Gemini` style payloads.
-- Tool Calling 2.0 oriented runtime with direct tools, command skills, Python hook skills, MCP tools, and plugin mounting.
+- Explicit runtime layering so the scheduler, orchestrator, tool registry, storage, and protocol adapters stay inspectable.
+- Unified protocol adaptation for `OpenAI`, `Anthropic`, and `Gemini` style model payloads.
+- Tool Calling 2.0 support for direct tools, command skills, Python hook skills, MCP tools, and plugin mounting.
 - `single_agent`, `sub_agent`, `multi_agent_graph`, and `Agent Teams` collaboration modes.
-- Explicit guardrail hooks before tool execution and before final output emission.
-- Schema-aware tool-call validation plus a self-repair loop when the model emits invalid arguments.
-- Session-oriented memory with durable `session_id` support for message history and shared graph state.
-- Resumable checkpoints for long-running graph workflows and top-level team workflows.
-- Enriched tracing and event streaming across run, agent, team, tool, guardrail, and MCP boundaries.
-- Sandboxed execution for command skills and `stdio` MCP with Windows fallback handling.
-- Public evaluation harnesses for BFCL subset cases and tau2 mock cases.
+- Long-running harnesses with durable artifacts, explicit completion contracts, evaluator-driven continue or replan decisions, and resumable checkpoints.
+- Session-oriented memory for direct runs, top-level teams, and harness state reuse.
+- Guardrail hooks before tool execution and before final output emission.
+- Schema-aware tool validation with a repair loop when the model emits invalid arguments.
+- Event streaming and tracing across agent, team, tool, guardrail, harness, and MCP boundaries.
+- SQLite plus JSONL persistence for runs, traces, checkpoints, and session state.
+- Public evaluation helpers for BFCL subset cases and tau2 mock cases.
 
-## Current Architecture
+## Architecture
+
+The runtime is intentionally white-box. The important layers are visible and replaceable.
+
+- `scheduler` runs direct-agent and graph workflows.
+- `harness` runs long tasks through explicit initializer, worker, and evaluator phases.
+- `orchestrator` executes agent and team turns.
+- `registry` exposes direct tools, skills, MCP tools, and mounted plugin tools.
+- `storage` persists runs, traces, checkpoints, session state, and harness state.
+- `protocol adapters` normalize provider-specific request and response shapes.
 
 ### Runtime Topology
 
 ```mermaid
 flowchart LR
-    User[User or Script] --> CLI[Typer CLI]
+    User[User] --> CLI[Typer CLI]
     CLI --> Runtime[EasyAgentRuntime]
     Runtime --> Scheduler[GraphScheduler]
+    Runtime --> Harness[HarnessRuntime]
     Scheduler --> Orchestrator[AgentOrchestrator]
-    Scheduler --> Guardrails[GuardrailEngine]
+    Harness --> Orchestrator
     Orchestrator --> Registry[ToolRegistry]
-    Orchestrator --> Model[HttpModelClient]
-    Model --> Adapter[ProtocolAdapter]
+    Orchestrator --> Store[SQLiteRunStore]
+    Orchestrator --> Client[HttpModelClient]
+    Client --> Adapter[ProtocolAdapter]
     Adapter --> Provider[Provider API]
+    Registry --> DirectTools[Direct Tools]
+    Registry --> CommandSkills[Command Skills]
+    Registry --> PythonSkills[Python Hook Skills]
+    Registry --> MCPTools[MCP Tools]
     Runtime --> Plugins[Plugin Host]
     Plugins --> Registry
-    Runtime --> MCP[McpClientManager]
-    MCP --> Stdio[stdio transport]
-    MCP --> Remote[HTTP_SSE transport]
-    Registry --> Skills[Skills and Local Tools]
-    Scheduler --> Store[SQLiteRunStore]
-    Orchestrator --> Store
-    Runtime --> Stream[Event Stream]
-    Stream --> CLI
-    Sandbox[SandboxManager] -. isolates .-> Skills
-    Sandbox -. isolates .-> Stdio
+    Runtime --> Events[Event Stream]
+    Events --> CLI
 ```
 
-### Communication Flow
+## Long-Running Harness Design
+
+Long-running work should not depend on a single giant prompt. In this repository, a harness is a first-class runtime capability.
+
+Each harness defines:
+
+- an `initializer_agent`
+- a `worker_target` that can be an agent or a team
+- an `evaluator_agent`
+- an explicit `completion_contract`
+- durable artifact paths
+- bounded `max_cycles` and `max_replans`
+
+The harness writes three durable files per session:
+
+- `bootstrap.md`: human-readable kickoff and recovery instructions
+- `progress.md`: cycle-by-cycle progress log
+- `features.json`: machine-readable state, decisions, and counters
+
+### Harness Loop
 
 ```mermaid
-sequenceDiagram
-    participant CLI as CLI
-    participant Scheduler as GraphScheduler
-    participant Guard as GuardrailEngine
-    participant Orchestrator as AgentOrchestrator
-    participant Model as HttpModelClient
-    participant Provider as Provider API
-    participant Tool as Tool or Skill or MCP
-    participant Store as SQLiteRunStore
-    CLI->>Scheduler: run(input, session_id)
-    Scheduler->>Orchestrator: dispatch entrypoint
-    Orchestrator->>Model: complete(messages, tools)
-    Model->>Provider: HTTP request
-    Provider-->>Model: assistant text and tool calls
-    Model-->>Orchestrator: normalized response
-    Orchestrator->>Guard: validate tool input
-    Guard-->>Orchestrator: allow or block
-    Orchestrator->>Tool: invoke tool call
-    Tool-->>Orchestrator: tool result
-    Orchestrator->>Store: record trace and events
-    Scheduler->>Guard: validate final output
-    Guard-->>Scheduler: allow or block
-    Scheduler->>Store: persist run, checkpoint, session state
-    Scheduler-->>CLI: result or resumable failure state
+flowchart TD
+    Start[Start Run] --> Init[Initializer]
+    Init --> Files[Write Bootstrap and State Files]
+    Files --> Worker[Worker]
+    Worker --> Eval[Evaluator]
+    Eval -->|CONTINUE| Worker
+    Eval -->|REPLAN| Init
+    Eval -->|COMPLETE| Finish[Finish Run]
 ```
 
-### Current Communication Model
+The harness design is informed by Anthropic's article [Effective harnesses for long-running agents](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents) published on November 26, 2025. The key idea is simple: long tasks need explicit coordination code, clear completion checks, and recoverable artifacts, not just a stronger model.
 
-- Model calls go through `HttpModelClient`, then through a protocol adapter for `OpenAI`, `Anthropic`, or `Gemini` style payloads.
-- Skills register as runtime tools through Python hooks or local command wrappers.
-- MCP communication currently supports `stdio` and `HTTP/SSE` in the implemented codebase.
-- Guardrails run before tool execution and before final output emission.
-- Runtime traces, session messages, session state, checkpoints, and event envelopes are persisted into SQLite plus JSONL traces.
-- CLI streaming uses the same runtime event channel that records agent, team, tool, guardrail, and MCP transitions.
+## Protocol and Tool Model
 
-## State, Memory, and Recovery
+### Model Protocols
 
-- Direct agent and top-level team runs can reuse prior conversation context by passing `--session-id`.
-- Graph runs persist `shared_state` under the same `session_id`, so later runs can continue from durable graph context.
-- Graph checkpoints are created at graph start and after each successful node.
-- Top-level team checkpoints are created at team start and after each completed turn.
-- `easy-agent resume <run_id>` restores the latest checkpoint for resumable graph and top-level team runs.
+- `OpenAI` style payloads, including OpenAI-compatible providers such as DeepSeek.
+- `Anthropic` style payloads.
+- `Gemini` style payloads.
+
+### Tool Calling 2.0 Runtime
+
+The runtime can expose tools from multiple sources through one registry:
+
+- direct in-process tools
+- command skills
+- Python hook skills
+- MCP tools over `stdio` or `HTTP/SSE`
+- mounted plugins from local paths, manifests, or entry points
 
 ## Project Layout
 
@@ -145,51 +179,18 @@ src/
   agent_graph/         orchestration, graph scheduling, team runtime
   agent_integrations/  skills, MCP, plugins, sandbox, storage, guardrails
   agent_protocols/     protocol adapters and model client
-  agent_runtime/       runtime assembly, benchmarks, long-run flows, public eval
+  agent_runtime/       runtime assembly, harnesses, benchmarks, long-run flows, public eval
 skills/
   examples/            local demo skills
   real/                real validation skills
 configs/
+  harness.example.yml  long-running harness example
   longrun.example.yml  real MCP + skill validation
   teams.example.yml    Agent Teams examples
-public_evals/
-  fixtures/            vendored BFCL and tau2 public subsets
-scripts/
-  benchmark_modes.py   live benchmark for six execution modes
-  windows/             easy-agent.ps1 / easy-agent.bat
 tests/
-  unit/                fast isolated unit tests
+  unit/                fast isolated tests
   integration/         live-service integration tests
 ```
-
-## Collaboration Modes
-
-- `single_agent`: one agent uses tools directly.
-- `sub_agent`: one coordinator delegates focused work through `subagent__*` tools.
-- `multi_agent_graph`: graph nodes schedule multiple agents and join outputs.
-- `Agent Teams`:
-  - `round_robin`
-  - `selector`
-  - `swarm`
-
-## Plugins, Skills, and MCP
-
-```python
-from pathlib import Path
-
-from agent_runtime.runtime import build_runtime
-
-runtime = build_runtime('easy-agent.yml')
-runtime.load(Path('skills/examples'))
-runtime.load('third_party_plugin')
-```
-
-Supported mounting paths:
-
-- local skill directories
-- plugin manifests such as `plugin.yaml` or `easy-agent-plugin.yaml`
-- Python package entry points in `agent_runtime.plugins`
-- configured MCP servers from YAML config
 
 ## Quick Start
 
@@ -202,9 +203,9 @@ uv sync --dev
 
 ### Local Credentials
 
-The runtime supports a local-only `.env.local` file. Use it for machine-specific secrets so you do not need to export environment variables every time.
+The runtime auto-loads a local-only `.env.local` file. This keeps machine-specific secrets out of tracked files while avoiding repeated manual exports.
 
-Example keys:
+Example:
 
 ```dotenv
 DEEPSEEK_API_KEY=your-key
@@ -223,70 +224,37 @@ uv run easy-agent doctor -c easy-agent.yml
 uv run easy-agent skills list -c easy-agent.yml
 uv run easy-agent plugins list -c easy-agent.yml
 uv run easy-agent teams list -c configs/teams.example.yml
+uv run easy-agent harness list -c configs/harness.example.yml
+uv run easy-agent harness run delivery_loop "Create a release summary for this repository" -c configs/harness.example.yml --session-id demo-harness
+uv run easy-agent harness resume <run_id> -c configs/harness.example.yml
 uv run easy-agent run "summarize the repository" --session-id demo-session -c easy-agent.yml
 uv run easy-agent resume <run_id> -c configs/teams.example.yml
-uv run python scripts/benchmark_modes.py --config easy-agent.yml --repeat 1
-uv run easy-agent integration public-eval -c easy-agent.yml --output .easy-agent/public-eval-report.json
-uv run easy-agent integration longrun -c configs/longrun.example.yml --cycles 1 --output-root .easy-agent/longrun
 ```
 
-### Windows Launchers
+### Python Runtime Example
 
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts/windows/easy-agent.ps1 --help
-cmd /c scripts/windows/easy-agent.bat --help
+```python
+from pathlib import Path
+
+from agent_runtime.runtime import build_runtime
+
+runtime = build_runtime('configs/harness.example.yml')
+runtime.load(Path('skills/examples'))
+runtime.load('third_party_plugin')
 ```
 
-## Real Usage Results
+## What a Harness Run Produces
 
-### Live Benchmark Snapshot
+A successful harness run does more than return text.
 
-The latest local benchmark snapshot comes from `.easy-agent/benchmark-report.json` on March 26, 2026 using DeepSeek through the OpenAI-compatible path.
+- It persists run metadata and checkpoints in SQLite.
+- It streams runtime events for CLI or observer consumption.
+- It writes `bootstrap.md`, `progress.md`, and `features.json` so a later run can resume from explicit state.
+- It can reuse prior harness state when you pass the same `--session-id`.
 
-| Mode | Success | Avg Seconds | Avg Tool Calls | Avg SubAgent Calls |
-| --- | --- | ---: | ---: | ---: |
-| `single_agent` | 1/1 | 4.9189 | 1 | 0 |
-| `sub_agent` | 1/1 | 15.9533 | 1 | 1 |
-| `multi_agent_graph` | 1/1 | 13.4902 | 2 | 0 |
-| `team_round_robin` | 1/1 | 7.7634 | 1 | 0 |
-| `team_selector` | 1/1 | 26.4179 | 1 | 0 |
-| `team_swarm` | 1/1 | 10.5093 | 2 | 0 |
+## Verification
 
-### Public Eval Snapshot
-
-The latest local public-eval snapshot comes from `.easy-agent/public-eval-report.json` on March 26, 2026.
-
-| Suite | Success | Pass Rate | Tool Match | Arg Match | Avg Seconds |
-| --- | --- | ---: | ---: | ---: | ---: |
-| `bfcl_simple` | 6/8 | 0.7500 | 0.7500 | 0.7500 | 10.6425 |
-| `bfcl_multiple` | 2/8 | 0.2500 | 0.2500 | 0.2500 | 4.5149 |
-| `bfcl_parallel_multiple` | 0/4 | 0.0000 | 0.0000 | 0.0000 | 13.7242 |
-| `bfcl_irrelevance` | 0/4 | 0.0000 | 0.0000 | 0.0000 | 2.3965 |
-| `tau2_mock` | 3/3 | 1.0000 | 1.0000 | 1.0000 | 5.9955 |
-| `overall_bfcl` | 8/24 | 0.3333 | 0.3333 | 0.3333 | - |
-
-Observed in this DeepSeek baseline:
-
-- The tau2 mock subset is stable and fully passing after adding session-history prompt fallback.
-- The BFCL subset is partially passing after normalizing tool schemas and sanitizing function names for OpenAI-compatible tool calling.
-- The remaining BFCL failures are concentrated in multi-tool and irrelevance cases. In this March 26, 2026 run, several of those cases still triggered provider-side `400 Bad Request` responses from `https://api.deepseek.com/chat/completions`, so BFCL should currently be treated as a compatibility baseline, not a finished leaderboard score.
-
-## Design References
-
-The current runtime borrows explicit ideas from production-facing agent systems without hiding them behind opaque abstractions.
-
-- OpenAI Agents SDK Sessions: <https://openai.github.io/openai-agents-python/sessions/>
-- OpenAI Agents SDK Handoffs: <https://openai.github.io/openai-agents-python/handoffs/>
-- OpenAI Agents SDK Guardrails: <https://openai.github.io/openai-agents-python/guardrails/>
-- OpenAI Agents SDK Tracing: <https://openai.github.io/openai-agents-python/tracing/>
-- AutoGen Teams: <https://microsoft.github.io/autogen/stable/user-guide/agentchat-user-guide/tutorial/teams.html>
-- AutoGen Selector Group Chat: <https://microsoft.github.io/autogen/stable/user-guide/agentchat-user-guide/selector-group-chat.html>
-- AutoGen Swarm: <https://microsoft.github.io/autogen/stable/user-guide/agentchat-user-guide/swarm.html>
-- LangGraph Durable Execution: <https://docs.langchain.com/oss/python/langgraph/durable-execution>
-- LangGraph Memory: <https://docs.langchain.com/oss/python/langgraph/memory>
-- MCP Transports: <https://modelcontextprotocol.io/docs/concepts/transports>
-
-## Testing
+The repository currently uses these verification paths on this machine:
 
 ```powershell
 uv run ruff check src tests scripts
@@ -295,15 +263,27 @@ uv run python -m pytest tests/unit -q
 uv run python -m pytest tests/integration -m real -q
 uv run easy-agent --help
 uv run easy-agent doctor -c easy-agent.yml
+uv run easy-agent harness list -c configs/harness.example.yml
 uv run easy-agent teams list -c configs/teams.example.yml
 ```
 
-For the full live suite, local PostgreSQL and Redis credentials must be available in `.env.local` or environment variables.
+For Windows, a stable pytest run should use an explicit `--basetemp` rooted under the system temporary directory.
+
+## Design References
+
+- Anthropic, [Effective harnesses for long-running agents](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents)
+- OpenAI Agents SDK Sessions: <https://openai.github.io/openai-agents-python/sessions/>
+- OpenAI Agents SDK Handoffs: <https://openai.github.io/openai-agents-python/handoffs/>
+- OpenAI Agents SDK Guardrails: <https://openai.github.io/openai-agents-python/guardrails/>
+- OpenAI Agents SDK Tracing: <https://openai.github.io/openai-agents-python/tracing/>
+- AutoGen Teams: <https://microsoft.github.io/autogen/stable/user-guide/agentchat-user-guide/tutorial/teams.html>
+- LangGraph Durable Execution: <https://docs.langchain.com/oss/python/langgraph/durable-execution>
+- MCP Transports: <https://modelcontextprotocol.io/docs/concepts/transports>
 
 ## Acknowledgements
 
 - [Linux.do](https://linux.do/) for community discussion and open knowledge sharing.
-- [![DeepSeek](https://img.shields.io/badge/DeepSeek-deepseek--chat-2563EB?style=flat-square)](https://www.deepseek.com/) for the real verification baseline and model endpoint.
+- [![DeepSeek](https://img.shields.io/badge/DeepSeek-deepseek--chat-2563EB?style=flat-square)](https://www.deepseek.com/) for the live verification baseline and model endpoint.
 
 ## License
 

@@ -35,6 +35,7 @@ storage:
     assert config.model.protocol is Protocol.AUTO
     assert Path(config.storage.path) == tmp_path / 'state'
     assert config.graph.teams == []
+    assert config.harnesses == []
 
 
 def test_graph_allows_team_entrypoint() -> None:
@@ -66,6 +67,68 @@ def test_graph_allows_team_entrypoint() -> None:
 
     assert config.graph.entrypoint == 'writer_team'
     assert config.team_map['writer_team'].mode.value == 'round_robin'
+
+
+def test_harness_validation_accepts_agent_and_team_targets() -> None:
+    config = AppConfig.model_validate(
+        {
+            'graph': {
+                'entrypoint': 'planner',
+                'agents': [
+                    {'name': 'planner', 'description': 'Plans the work.'},
+                    {'name': 'worker', 'description': 'Works the task.'},
+                    {'name': 'evaluator', 'description': 'Evaluates the task.'},
+                ],
+                'teams': [
+                    {
+                        'name': 'worker_team',
+                        'mode': 'round_robin',
+                        'members': ['planner', 'worker'],
+                    }
+                ],
+                'nodes': [],
+            },
+            'harnesses': [
+                {
+                    'name': 'delivery_loop',
+                    'initializer_agent': 'planner',
+                    'worker_target': 'worker_team',
+                    'evaluator_agent': 'evaluator',
+                    'completion_contract': 'Finish the run.',
+                    'artifacts_dir': '.easy-agent/harness',
+                }
+            ],
+        }
+    )
+
+    assert config.harness_map['delivery_loop'].worker_target == 'worker_team'
+
+
+def test_harness_validation_rejects_unknown_targets() -> None:
+    with pytest.raises(ValueError, match='unknown worker_target'):
+        AppConfig.model_validate(
+            {
+                'graph': {
+                    'entrypoint': 'planner',
+                    'agents': [
+                        {'name': 'planner', 'description': 'Plans the work.'},
+                        {'name': 'evaluator', 'description': 'Evaluates the task.'},
+                    ],
+                    'teams': [],
+                    'nodes': [],
+                },
+                'harnesses': [
+                    {
+                        'name': 'delivery_loop',
+                        'initializer_agent': 'planner',
+                        'worker_target': 'missing-worker',
+                        'evaluator_agent': 'evaluator',
+                        'completion_contract': 'Finish the run.',
+                        'artifacts_dir': '.easy-agent/harness',
+                    }
+                ],
+            }
+        )
 
 
 def test_selector_team_requires_member_descriptions() -> None:

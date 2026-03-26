@@ -77,12 +77,23 @@ def test_doctor_rows_include_runtime_stack_details() -> None:
                 'agents': [
                     {'name': 'planner', 'description': 'Plans work.'},
                     {'name': 'closer', 'description': 'Closes work.'},
+                    {'name': 'evaluator', 'description': 'Evaluates work.'},
                 ],
                 'teams': [
                     {'name': 'writer_team', 'mode': 'round_robin', 'members': ['planner', 'closer']}
                 ],
                 'nodes': [],
             },
+            'harnesses': [
+                {
+                    'name': 'delivery_loop',
+                    'initializer_agent': 'planner',
+                    'worker_target': 'writer_team',
+                    'evaluator_agent': 'evaluator',
+                    'completion_contract': 'Finish the work.',
+                    'artifacts_dir': '.easy-agent/harness',
+                }
+            ],
             'mcp': [{'name': 'filesystem', 'transport': 'stdio'}],
         }
     )
@@ -94,6 +105,7 @@ def test_doctor_rows_include_runtime_stack_details() -> None:
     assert rows['Model'] == 'deepseek-chat'
     assert rows['Entrypoint'] == 'writer_team'
     assert rows['Entrypoint Type'] == 'team'
+    assert rows['Harnesses'] == '1'
     assert rows['Configured MCP Servers'] == '1'
     assert rows['MCP Transports'] == 'filesystem:stdio'
     assert rows['Tool Guardrails'] == 'block_shell_metacharacters'

@@ -17,6 +17,7 @@ from agent_integrations.sandbox import SandboxManager, SandboxMode
 from agent_integrations.skills import SkillLoader, SkillMetadata
 from agent_integrations.storage import SQLiteRunStore
 from agent_protocols.client import HttpModelClient
+from agent_runtime.harness import HarnessRuntime
 
 
 class EasyAgentRuntime:
@@ -31,6 +32,7 @@ class EasyAgentRuntime:
         guardrail_engine: GuardrailEngine,
         orchestrator: AgentOrchestrator,
         scheduler: GraphScheduler,
+        harness_runtime: HarnessRuntime,
         skills: list[SkillMetadata] | None = None,
     ) -> None:
         self.config = config
@@ -42,6 +44,7 @@ class EasyAgentRuntime:
         self.guardrail_engine = guardrail_engine
         self.orchestrator = orchestrator
         self.scheduler = scheduler
+        self.harness_runtime = harness_runtime
         self.skills = skills or []
         self.loaded_sources: list[str] = []
         self._loaded_skill_paths: set[Path] = set()
@@ -54,6 +57,9 @@ class EasyAgentRuntime:
         if descriptor not in self.loaded_sources:
             self.loaded_sources.append(descriptor)
         return self
+
+    def list_harnesses(self) -> list[Any]:
+        return self.harness_runtime.list_harnesses()
 
     def register_skill_path(self, path: Path) -> list[SkillMetadata]:
         if self._started:
@@ -115,6 +121,11 @@ class EasyAgentRuntime:
             await self.start()
         return await self.scheduler.run(input_text, session_id=session_id)
 
+    async def run_harness(self, name: str, input_text: str, session_id: str | None = None) -> dict[str, Any]:
+        if not self._started:
+            await self.start()
+        return await self.harness_runtime.run(name, input_text, session_id=session_id)
+
     async def stream(self, input_text: str, session_id: str | None = None) -> AsyncIterator[dict[str, Any]]:
         if not self._started:
             await self.start()
@@ -145,10 +156,50 @@ class EasyAgentRuntime:
         if result is not None:
             return
 
+    async def stream_harness(
+        self,
+        name: str,
+        input_text: str,
+        session_id: str | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        if not self._started:
+            await self.start()
+        stream = self.store.subscribe_events()
+        result: dict[str, Any] | None = None
+        error: Exception | None = None
+        selected_run_id: str | None = None
+
+        async def _runner() -> None:
+            nonlocal result, error
+            try:
+                result = await self.harness_runtime.run(name, input_text, session_id=session_id)
+            except Exception as exc:
+                error = exc
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(_runner)
+            async with stream:
+                async for event in stream:
+                    if selected_run_id is None and event['kind'] == 'run_started':
+                        selected_run_id = str(event['run_id'])
+                    if selected_run_id is None or event['run_id'] == selected_run_id:
+                        yield event
+                        if event['kind'] in {'run_succeeded', 'run_failed', 'run_interrupted'} and event['run_id'] == selected_run_id:
+                            break
+        if error is not None:
+            raise error
+        if result is not None:
+            return
+
     async def resume(self, run_id: str) -> dict[str, Any]:
         if not self._started:
             await self.start()
         return await self.scheduler.resume(run_id)
+
+    async def resume_harness(self, run_id: str) -> dict[str, Any]:
+        if not self._started:
+            await self.start()
+        return await self.harness_runtime.resume(run_id)
 
     async def resume_stream(self, run_id: str) -> AsyncIterator[dict[str, Any]]:
         if not self._started:
@@ -160,6 +211,30 @@ class EasyAgentRuntime:
             nonlocal error
             try:
                 await self.scheduler.resume(run_id)
+            except Exception as exc:
+                error = exc
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(_runner)
+            async with stream:
+                async for event in stream:
+                    if event['run_id'] == run_id:
+                        yield event
+                        if event['kind'] in {'run_succeeded', 'run_failed', 'run_interrupted'}:
+                            break
+        if error is not None:
+            raise error
+
+    async def resume_harness_stream(self, run_id: str) -> AsyncIterator[dict[str, Any]]:
+        if not self._started:
+            await self.start()
+        stream = self.store.subscribe_events()
+        error: Exception | None = None
+
+        async def _runner() -> None:
+            nonlocal error
+            try:
+                await self.harness_runtime.resume(run_id)
             except Exception as exc:
                 error = exc
 
@@ -199,6 +274,7 @@ def build_runtime_from_config(config: AppConfig) -> EasyAgentRuntime:
     model_client = HttpModelClient(config.model)
     orchestrator = AgentOrchestrator(config, model_client, registry, store, guardrail_engine)
     scheduler = GraphScheduler(config, registry, orchestrator, store, mcp_manager, guardrail_engine)
+    harness_runtime = HarnessRuntime(config, orchestrator, store, guardrail_engine)
     runtime = EasyAgentRuntime(
         config,
         model_client,
@@ -209,6 +285,7 @@ def build_runtime_from_config(config: AppConfig) -> EasyAgentRuntime:
         guardrail_engine,
         orchestrator,
         scheduler,
+        harness_runtime,
     )
     for plugin_source in config.plugins:
         runtime.load(plugin_source)

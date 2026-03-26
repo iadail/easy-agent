@@ -1,4 +1,4 @@
-"""Runtime assembly, benchmark, long-run, and public-eval helpers."""
+"""Runtime assembly, benchmark, long-run, harness, and public-eval helpers."""
 
 from agent_runtime.benchmark import (
     BenchmarkCase,
@@ -8,6 +8,7 @@ from agent_runtime.benchmark import (
     run_default_suite,
     summarize_trace,
 )
+from agent_runtime.harness import HarnessRuntime
 from agent_runtime.longrun import (
     LongRunRecord,
     build_longrun_cases,
@@ -22,6 +23,7 @@ __all__ = [
     'BenchmarkCase',
     'BenchmarkRecord',
     'EasyAgentRuntime',
+    'HarnessRuntime',
     'LongRunRecord',
     'PublicEvalRecord',
     'build_default_cases',

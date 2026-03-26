@@ -86,9 +86,18 @@ class SQLiteRunStore:
                     payload TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS harness_state (
+                    session_id TEXT NOT NULL,
+                    harness_name TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(session_id, harness_name)
+                );
                 """
             )
             self._ensure_runs_column(connection, 'session_id', 'TEXT')
+            self._ensure_runs_column(connection, 'run_kind', "TEXT NOT NULL DEFAULT 'graph'")
             connection.commit()
 
     @staticmethod
@@ -97,12 +106,19 @@ class SQLiteRunStore:
         if column_name not in columns:
             connection.execute(f'ALTER TABLE runs ADD COLUMN {column_name} {column_type}')
 
-    def create_run(self, run_id: str, graph_name: str, input_payload: Any, session_id: str | None = None) -> None:
+    def create_run(
+        self,
+        run_id: str,
+        graph_name: str,
+        input_payload: Any,
+        session_id: str | None = None,
+        run_kind: str = 'graph',
+    ) -> None:
         self._event_sequences.setdefault(run_id, 0)
         with closing(self._connect()) as connection:
             connection.execute(
-                'INSERT INTO runs(run_id, graph_name, status, input_payload, created_at, session_id) VALUES (?, ?, ?, ?, ?, ?)',
-                (run_id, graph_name, 'running', self._encode(input_payload), self._now(), session_id),
+                'INSERT INTO runs(run_id, graph_name, status, input_payload, created_at, session_id, run_kind) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                (run_id, graph_name, 'running', self._encode(input_payload), self._now(), session_id, run_kind),
             )
             connection.commit()
 
@@ -125,7 +141,7 @@ class SQLiteRunStore:
     def load_run(self, run_id: str) -> dict[str, Any]:
         with closing(self._connect()) as connection:
             row = connection.execute(
-                'SELECT graph_name, status, input_payload, output_payload, created_at, session_id FROM runs WHERE run_id = ?',
+                'SELECT graph_name, status, input_payload, output_payload, created_at, session_id, run_kind FROM runs WHERE run_id = ?',
                 (run_id,),
             ).fetchone()
         if row is None:
@@ -138,6 +154,7 @@ class SQLiteRunStore:
             'output_payload': self._decode(row[3]),
             'created_at': row[4],
             'session_id': row[5],
+            'run_kind': row[6] or 'graph',
         }
 
     def record_node(
@@ -251,6 +268,26 @@ class SQLiteRunStore:
             return {}
         return cast(dict[str, Any], self._decode(row[0]))
 
+    def save_harness_state(self, session_id: str, harness_name: str, payload: dict[str, Any]) -> None:
+        updated_at = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute(
+                'INSERT INTO harness_state(session_id, harness_name, payload, updated_at) VALUES (?, ?, ?, ?) '
+                'ON CONFLICT(session_id, harness_name) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at',
+                (session_id, harness_name, self._encode(payload), updated_at),
+            )
+            connection.commit()
+
+    def load_harness_state(self, session_id: str, harness_name: str) -> dict[str, Any]:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                'SELECT payload FROM harness_state WHERE session_id = ? AND harness_name = ?',
+                (session_id, harness_name),
+            ).fetchone()
+        if row is None:
+            return {}
+        return cast(dict[str, Any], self._decode(row[0]))
+
     def create_checkpoint(self, run_id: str, kind: str, payload: Any) -> None:
         with closing(self._connect()) as connection:
             connection.execute(
@@ -298,6 +335,7 @@ class SQLiteRunStore:
             events.append({'kind': row[0], 'created_at': row[2], **body})
         return {
             'graph_name': run_row['graph_name'],
+            'run_kind': run_row['run_kind'],
             'status': run_row['status'],
             'session_id': run_row['session_id'],
             'input_payload': run_row['input_payload'],

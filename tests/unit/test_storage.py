@@ -14,6 +14,7 @@ def test_sqlite_run_store_persists_trace(tmp_path: Path) -> None:
     trace = store.load_trace('run_1')
 
     assert trace['status'] == 'succeeded'
+    assert trace['run_kind'] == 'graph'
     assert trace['nodes'][0]['node_id'] == 'node_1'
     assert trace['events'][0]['kind'] == 'custom'
     assert trace['events'][0]['scope'] == 'agent'
@@ -32,17 +33,21 @@ def test_sqlite_run_store_persists_session_memory_and_checkpoints(tmp_path: Path
     store.create_run('run_2', 'baseline', {'input': 'hello'}, session_id='session-a')
     store.save_session_messages('session-a', 'baseline', messages)
     store.save_session_state('session-a', 'baseline', {'input': 'hello', 'node_a': {'value': 1}})
+    store.save_harness_state('session-a', 'delivery_loop', {'status': 'running', 'cycle_index': 2})
     store.create_checkpoint('run_2', 'graph', {'results': {'node_a': {'value': 1}}, 'remaining': ['node_b']})
 
     run_payload = store.load_run('run_2')
     restored_messages = store.load_session_messages('session-a')
     restored_state = store.load_session_state('session-a')
+    restored_harness_state = store.load_harness_state('session-a', 'delivery_loop')
     checkpoint = store.load_latest_checkpoint('run_2')
     trace = store.load_trace('run_2')
 
     assert run_payload['session_id'] == 'session-a'
+    assert run_payload['run_kind'] == 'graph'
     assert [message.content for message in restored_messages] == ['hello', 'world']
     assert restored_state['node_a']['value'] == 1
+    assert restored_harness_state['cycle_index'] == 2
     assert checkpoint is not None
     assert checkpoint['kind'] == 'graph'
     assert checkpoint['payload']['remaining'] == ['node_b']

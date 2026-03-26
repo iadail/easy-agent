@@ -140,6 +140,17 @@ class GraphConfig(BaseModel):
         return self
 
 
+class HarnessConfig(BaseModel):
+    name: str
+    initializer_agent: str
+    worker_target: str
+    evaluator_agent: str
+    completion_contract: str
+    artifacts_dir: str
+    max_cycles: int = 8
+    max_replans: int = 2
+
+
 class SkillSourceConfig(BaseModel):
     path: str
 
@@ -204,6 +215,7 @@ class SecurityConfig(BaseModel):
 class AppConfig(BaseModel):
     model: ModelConfig = Field(default_factory=ModelConfig)
     graph: GraphConfig
+    harnesses: list[HarnessConfig] = Field(default_factory=list)
     plugins: list[str] = Field(default_factory=list)
     skills: list[SkillSourceConfig] = Field(default_factory=list)
     mcp: list[McpServerConfig] = Field(default_factory=list)
@@ -221,6 +233,32 @@ class AppConfig(BaseModel):
     def team_map(self) -> dict[str, TeamConfig]:
         return {team.name: team for team in self.graph.teams}
 
+    @property
+    def harness_map(self) -> dict[str, HarnessConfig]:
+        return {harness.name: harness for harness in self.harnesses}
+
+    @model_validator(mode='after')
+    def validate_harnesses(self) -> AppConfig:
+        harness_names = [harness.name for harness in self.harnesses]
+        if len(harness_names) != len(set(harness_names)):
+            raise ValueError('harness names must be unique')
+
+        valid_workers = set(self.agent_map) | set(self.team_map)
+        for harness in self.harnesses:
+            if harness.initializer_agent not in self.agent_map:
+                raise ValueError(
+                    f"harness '{harness.name}' references unknown initializer_agent '{harness.initializer_agent}'"
+                )
+            if harness.evaluator_agent not in self.agent_map:
+                raise ValueError(
+                    f"harness '{harness.name}' references unknown evaluator_agent '{harness.evaluator_agent}'"
+                )
+            if harness.worker_target not in valid_workers:
+                raise ValueError(
+                    f"harness '{harness.name}' references unknown worker_target '{harness.worker_target}'"
+                )
+        return self
+
 
 def load_config(path: str | Path) -> AppConfig:
     load_local_env(path)
@@ -230,6 +268,7 @@ def load_config(path: str | Path) -> AppConfig:
     expanded = _expand_env(raw)
     graph = expanded.setdefault('graph', {})
     graph.setdefault('teams', [])
+    expanded.setdefault('harnesses', [])
     return AppConfig.model_validate(expanded)
 
 

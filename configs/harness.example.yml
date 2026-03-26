@@ -1,0 +1,87 @@
+model:
+  provider: deepseek
+  protocol: auto
+  model: deepseek-chat
+  base_url: https://api.deepseek.com
+  api_key_env: DEEPSEEK_API_KEY
+  timeout_seconds: 60
+  max_tokens: 2048
+  temperature: 0.1
+
+graph:
+  name: harness-example
+  entrypoint: worker
+  agents:
+    - name: initializer
+      description: Prepare the initial contract and durable work instructions.
+      system_prompt: |
+        You are the harness initializer. Produce a compact kickoff summary with the goal, acceptance criteria,
+        first action, and major risks. Do not claim the work is complete.
+      tools: []
+      sub_agents: []
+      max_iterations: 4
+    - name: worker
+      description: Execute one incremental step and use direct tools when they materially help.
+      system_prompt: |
+        You are the harness worker. Use python_echo exactly once when it helps you ground the task,
+        then summarize the completed increment and what remains.
+      tools:
+        - python_echo
+      sub_agents: []
+      max_iterations: 6
+    - name: evaluator
+      description: Decide whether the completion contract has been satisfied.
+      system_prompt: |
+        You are the harness evaluator. Follow the requested decision format exactly and be strict about the contract.
+      tools: []
+      sub_agents: []
+      max_iterations: 4
+  nodes: []
+
+harnesses:
+  - name: delivery_loop
+    initializer_agent: initializer
+    worker_target: worker
+    evaluator_agent: evaluator
+    completion_contract: Complete the requested task with a clear final status and no unresolved blockers.
+    artifacts_dir: .easy-agent/harness-example
+    max_cycles: 4
+    max_replans: 1
+
+plugins: []
+
+skills:
+  - path: skills/examples
+
+mcp: []
+
+storage:
+  path: .easy-agent/harness-example
+  database: state.db
+
+logging:
+  level: INFO
+
+security:
+  allowed_commands:
+    - ["cmd", "/c", "echo"]
+  sandbox:
+    mode: auto
+    targets:
+      - command_skill
+      - stdio_mcp
+    env_allowlist:
+      - PATH
+      - PATHEXT
+      - SYSTEMROOT
+      - WINDIR
+      - COMSPEC
+      - TEMP
+      - TMP
+      - USERPROFILE
+      - HOME
+      - APPDATA
+      - LOCALAPPDATA
+      - DEEPSEEK_API_KEY
+    working_root: .
+    windows_sandbox_fallback: process

@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Added a first-class `HarnessRuntime` for long-running work with explicit `initializer`, `worker`, and `evaluator` phases.
+- Added typed `harnesses` configuration with validation for initializer agents, evaluator agents, and agent or team worker targets.
+- Added resumable harness checkpoints and durable session-scoped harness state persistence.
+- Added CLI support for `easy-agent harness list`, `easy-agent harness run`, and `easy-agent harness resume`.
+- Added `configs/harness.example.yml` and `tests/integration/test_harness_real.py` for a concrete harness entrypoint and live DeepSeek smoke coverage.
+- Added unit coverage for harness initialization, resume, replan, team worker targets, config validation, storage persistence, and doctor output.
+
+### Changed
+
+- Reworked `easy-agent.yml` to include a baseline local harness example alongside the direct runtime entrypoint.
+- Rewrote both READMEs so they explain the project in plain language first and document the runtime layers, harness loop, protocols, and Tool Calling 2.0 model more clearly.
+- Clarified the runtime architecture around `scheduler`, `orchestrator`, `registry`, `storage`, `protocol adapters`, and the new `harness` layer.
+
 ## [0.3.0] - 2026-03-26
 
 ### Added

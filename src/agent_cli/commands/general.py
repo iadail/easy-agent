@@ -49,6 +49,7 @@ def _doctor_rows(runtime: Any) -> list[tuple[str, str]]:
         ('Entrypoint Type', _entrypoint_type(runtime)),
         ('Skills', str(len(runtime.skills))),
         ('Teams', str(len(runtime.config.graph.teams))),
+        ('Harnesses', str(len(runtime.config.harnesses))),
         ('Configured MCP Servers', str(len(runtime.config.mcp))),
         ('MCP Transports', _mcp_transport_summary(runtime)),
         ('Tool Guardrails', ', '.join(runtime.config.guardrails.tool_input_hooks)),

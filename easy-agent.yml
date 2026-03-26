@@ -13,6 +13,7 @@ graph:
   entrypoint: coordinator
   agents:
     - name: coordinator
+      description: Execute the current task increment and use available tools when they help.
       system_prompt: |
         You are the coordinator agent. Use available tools or delegate to sub-agents.
       tools:
@@ -22,13 +23,24 @@ graph:
         - analyst
       max_iterations: 6
     - name: analyst
+      description: Prepare kickoff summaries and evaluate whether the work contract is complete.
       system_prompt: |
-        You are a focused sub-agent that produces concise analysis.
+        You are a focused analyst who prepares kickoff summaries and evaluates completion.
       tools:
         - python_echo
       sub_agents: []
       max_iterations: 4
   nodes: []
+
+harnesses:
+  - name: repo_delivery_loop
+    initializer_agent: analyst
+    worker_target: coordinator
+    evaluator_agent: analyst
+    completion_contract: Deliver one useful repository update and explain the outcome clearly.
+    artifacts_dir: .easy-agent/harness
+    max_cycles: 4
+    max_replans: 1
 
 plugins: []
 
