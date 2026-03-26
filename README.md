@@ -30,7 +30,7 @@ Many agent repositories jump straight from "call a model" to "ship a product". T
 - A first-class long-running harness with `initializer -> worker -> evaluator` loops, resumable checkpoints, and durable artifacts.
 - A unified model-call surface for `OpenAI`, `Anthropic`, and `Gemini` style payloads.
 - A Tool Calling 2.0 runtime that can host direct tools, command skills, Python hook skills, MCP tools, and mounted plugins.
-- Built-in session memory, tracing, event streaming, guardrails, and public evaluation helpers.
+- Built-in session memory, tracing, event streaming, guardrails, human approvals, replay tooling, and public evaluation helpers.
 
 ## Tech Stack
 
@@ -61,7 +61,7 @@ Many agent repositories jump straight from "call a model" to "ship a product". T
       <strong>Integration</strong><br>
       <img alt="Tools" src="https://img.shields.io/badge/Tools-direct%20tools-0891B2"><br>
       <img alt="Skills" src="https://img.shields.io/badge/Skills-command%20%7C%20Python%20hook-F97316"><br>
-      <img alt="MCP" src="https://img.shields.io/badge/MCP-stdio%20%7C%20HTTP%2FSSE-DC2626"><br>
+      <img alt="MCP" src="https://img.shields.io/badge/MCP-stdio%20%7C%20HTTP%2FSSE%20%7C%20streamable__HTTP-DC2626"><br>
       <img alt="Plugins" src="https://img.shields.io/badge/Plugins-path%20%7C%20manifest%20%7C%20entry%20point-0EA5E9">
     </td>
   </tr>
@@ -73,23 +73,25 @@ Many agent repositories jump straight from "call a model" to "ship a product". T
 - Unified protocol adaptation for `OpenAI`, `Anthropic`, and `Gemini` style model payloads.
 - Tool Calling 2.0 support for direct tools, command skills, Python hook skills, MCP tools, and plugin mounting.
 - `single_agent`, `sub_agent`, `multi_agent_graph`, and `Agent Teams` collaboration modes.
-- Long-running harnesses with durable artifacts, explicit completion contracts, evaluator-driven continue or replan decisions, and resumable checkpoints.
+- Long-running harnesses with durable artifacts, explicit completion contracts, evaluator-driven continue or replan decisions, resumable checkpoints, and approval-aware resume gates.
 - Session-oriented memory for direct runs, top-level teams, and harness state reuse.
+- Human approval workflows plus safe-point interrupts for sensitive tools, swarm handoffs, harness resumes, and MCP sampling or elicitation requests.
 - Guardrail hooks before tool execution and before final output emission.
 - Schema-aware tool validation with a repair loop when the model emits invalid arguments.
 - Event streaming and tracing across agent, team, tool, guardrail, harness, and MCP boundaries.
-- SQLite plus JSONL persistence for runs, traces, checkpoints, and session state.
+- SQLite plus JSONL persistence for runs, traces, checkpoints, session state, harness state, approval requests, interrupts, and resume lineage.
+- Historical checkpoint listing, time-travel replay, and branchable `--fork` resume for graph and team workflows.
+- MCP roots, sampling, elicitation, `streamable_http`, and authorization-aware remote transports with persisted OAuth state.
 - Public evaluation helpers for BFCL subset cases and tau2 mock cases.
 
-## Roadmap
+## Human Loop, Replay, and MCP
 
-These are the next reliability, safety, and interoperability upgrades, not claims about what the repository already ships today.
+The current runtime already ships the reliability controls that were previously only listed as roadmap work.
 
-- Human approval and interrupt points before sensitive tools, handoffs, and long-running checkpoint resumes.
-- Time-travel replay and branchable resume from historical checkpoints for graph and team workflows.
-- Richer MCP support for roots, sampling, elicitation, and authorization-aware remote transports.
-- Remote agent federation through A2A-style agent-to-agent communication.
-- Stronger executor and workbench isolation for long-lived code, tool, and environment tasks.
+- Sensitive tools can pause for human approval before execution, and swarm handoffs plus harness resumes can pause on the same human loop.
+- Runs expose safe-point interrupts, approval queues, checkpoint listing, historical replay, and branchable `resume --fork` flows.
+- MCP integrations now support explicit roots, backward-compatible filesystem root inference for stdio servers, sampling callbacks, elicitation callbacks, `streamable_http`, and auth-aware remote transports with persisted OAuth state.
+- The CLI exposes `approvals`, `checkpoints`, `replay`, `interrupt`, `mcp roots`, and `mcp auth` commands so these controls are usable without custom code.
 
 ## Architecture
 
@@ -176,7 +178,7 @@ The runtime can expose tools from multiple sources through one registry:
 - direct in-process tools
 - command skills
 - Python hook skills
-- MCP tools over `stdio` or `HTTP/SSE`
+- MCP tools over `stdio`, `HTTP/SSE`, or `streamable_http`
 - mounted plugins from local paths, manifests, or entry points
 
 ## Project Layout
@@ -235,10 +237,16 @@ uv run easy-agent skills list -c easy-agent.yml
 uv run easy-agent plugins list -c easy-agent.yml
 uv run easy-agent teams list -c configs/teams.example.yml
 uv run easy-agent harness list -c configs/harness.example.yml
-uv run easy-agent harness run delivery_loop "Create a release summary for this repository" -c configs/harness.example.yml --session-id demo-harness
-uv run easy-agent harness resume <run_id> -c configs/harness.example.yml
-uv run easy-agent run "summarize the repository" --session-id demo-session -c easy-agent.yml
-uv run easy-agent resume <run_id> -c configs/teams.example.yml
+uv run easy-agent run "summarize the repository" --session-id demo-session --approval-mode deferred -c easy-agent.yml
+uv run easy-agent approvals list --status pending -c easy-agent.yml
+uv run easy-agent checkpoints <run_id> -c configs/teams.example.yml
+uv run easy-agent replay <run_id> --checkpoint-id <checkpoint_id> -c configs/teams.example.yml
+uv run easy-agent resume <run_id> --checkpoint-id <checkpoint_id> --fork -c configs/teams.example.yml
+uv run easy-agent interrupt <run_id> --reason "human stop" -c configs/teams.example.yml
+uv run easy-agent harness run delivery_loop "Create a release summary for this repository" -c configs/harness.example.yml --session-id demo-harness --approval-mode deferred
+uv run easy-agent harness resume <run_id> -c configs/harness.example.yml --approval-mode deferred
+uv run easy-agent mcp roots list filesystem -c configs/longrun.example.yml
+uv run easy-agent mcp auth status filesystem -c configs/longrun.example.yml
 ```
 
 ### Python Runtime Example
@@ -280,13 +288,13 @@ uv run easy-agent teams list -c configs/teams.example.yml
 ## Design References
 
 - Anthropic, [Effective harnesses for long-running agents](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents)
-- OpenAI Agents SDK Sessions: <https://openai.github.io/openai-agents-python/sessions/>
-- OpenAI Agents SDK Handoffs: <https://openai.github.io/openai-agents-python/handoffs/>
-- OpenAI Agents SDK Guardrails: <https://openai.github.io/openai-agents-python/guardrails/>
-- OpenAI Agents SDK Tracing: <https://openai.github.io/openai-agents-python/tracing/>
-- AutoGen Teams: <https://microsoft.github.io/autogen/stable/user-guide/agentchat-user-guide/tutorial/teams.html>
-- LangGraph Durable Execution: <https://docs.langchain.com/oss/python/langgraph/durable-execution>
-- MCP Transports: <https://modelcontextprotocol.io/docs/concepts/transports>
+- OpenAI Agents SDK Sessions: [https://openai.github.io/openai-agents-python/sessions/](https://openai.github.io/openai-agents-python/sessions/)
+- OpenAI Agents SDK Handoffs: [https://openai.github.io/openai-agents-python/handoffs/](https://openai.github.io/openai-agents-python/handoffs/)
+- OpenAI Agents SDK Guardrails: [https://openai.github.io/openai-agents-python/guardrails/](https://openai.github.io/openai-agents-python/guardrails/)
+- OpenAI Agents SDK Tracing: [https://openai.github.io/openai-agents-python/tracing/](https://openai.github.io/openai-agents-python/tracing/)
+- AutoGen Teams: [https://microsoft.github.io/autogen/stable/user-guide/agentchat-user-guide/tutorial/teams.html](https://microsoft.github.io/autogen/stable/user-guide/agentchat-user-guide/tutorial/teams.html)
+- LangGraph Durable Execution: [https://docs.langchain.com/oss/python/langgraph/durable-execution](https://docs.langchain.com/oss/python/langgraph/durable-execution)
+- MCP Transports: [https://modelcontextprotocol.io/docs/concepts/transports](https://modelcontextprotocol.io/docs/concepts/transports)
 
 ## Acknowledgements
 
@@ -295,4 +303,4 @@ uv run easy-agent teams list -c configs/teams.example.yml
 
 ## License
 
-MIT
+[Apache-2.0](https://github.com/CloudWide851/easy-agent?tab=Apache-2.0-1-ov-file#)

@@ -3,11 +3,9 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from types import SimpleNamespace
-
 import pytest
 
-from agent_common.models import AssistantResponse, ChatMessage, Protocol, ToolCall, ToolSpec
+from agent_common.models import AssistantResponse, ChatMessage, HumanRequestStatus, Protocol, RunStatus, ToolCall, ToolSpec
 from agent_common.tools import ToolRegistry
 from agent_config.app import AppConfig, ModelConfig
 from agent_graph import AgentOrchestrator
@@ -203,18 +201,25 @@ async def test_harness_run_persists_artifacts_and_state(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_harness_resume_uses_checkpoint_without_rerunning_initializer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_harness_resume_uses_checkpoint_without_rerunning_initializer(tmp_path: Path) -> None:
     harness_runtime, store, client = build_harness_runtime(
         tmp_path,
         HarnessModelClient(fail_cycle_two_once=True),
     )
-    monkeypatch.setattr('agent_runtime.harness.uuid.uuid4', lambda: SimpleNamespace(hex='harness-resume-run'))
 
-    with pytest.raises(RuntimeError, match='failed'):
+    with pytest.raises(RuntimeError, match='failed') as exc_info:
         await harness_runtime.run('delivery_loop', 'finish the checklist', session_id='session-beta')
 
-    resumed = await harness_runtime.resume('harness-resume-run')
-    trace = store.load_trace('harness-resume-run')
+    run_id = str(exc_info.value).split()[2]
+    waiting = await harness_runtime.resume(run_id)
+    request = store.load_human_request(waiting['request_id'])
+
+    assert waiting['status'] == RunStatus.WAITING_APPROVAL.value
+    assert request.status is HumanRequestStatus.PENDING
+
+    store.resolve_human_request(request.request_id, status=HumanRequestStatus.APPROVED)
+    resumed = await harness_runtime.resume(run_id)
+    trace = store.load_trace(run_id)
 
     assert resumed['result']['status'] == 'succeeded'
     assert client.initializer_calls == 1

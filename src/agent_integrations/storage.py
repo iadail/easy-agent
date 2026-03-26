@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import uuid
+from uuid import uuid4
 from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
@@ -11,7 +11,13 @@ from typing import Any, cast
 import anyio
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 
-from agent_common.models import ChatMessage, RuntimeEvent
+from agent_common.models import (
+    ChatMessage,
+    HumanRequest,
+    HumanRequestStatus,
+    RunStatus,
+    RuntimeEvent,
+)
 
 
 class SQLiteRunStore:
@@ -38,7 +44,13 @@ class SQLiteRunStore:
                     status TEXT NOT NULL,
                     input_payload TEXT NOT NULL,
                     output_payload TEXT,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    session_id TEXT,
+                    run_kind TEXT NOT NULL DEFAULT 'graph',
+                    parent_run_id TEXT,
+                    source_run_id TEXT,
+                    source_checkpoint_id INTEGER,
+                    resume_strategy TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS node_events (
@@ -94,10 +106,42 @@ class SQLiteRunStore:
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY(session_id, harness_name)
                 );
+
+                CREATE TABLE IF NOT EXISTS human_requests (
+                    request_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    request_key TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    response_payload TEXT,
+                    created_at TEXT NOT NULL,
+                    resolved_at TEXT,
+                    UNIQUE(run_id, request_key)
+                );
+
+                CREATE TABLE IF NOT EXISTS interrupt_requests (
+                    run_id TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    requested_at TEXT NOT NULL,
+                    consumed_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS oauth_state (
+                    server_name TEXT PRIMARY KEY,
+                    tokens_payload TEXT,
+                    client_info_payload TEXT,
+                    updated_at TEXT NOT NULL
+                );
                 """
             )
             self._ensure_runs_column(connection, 'session_id', 'TEXT')
             self._ensure_runs_column(connection, 'run_kind', "TEXT NOT NULL DEFAULT 'graph'")
+            self._ensure_runs_column(connection, 'parent_run_id', 'TEXT')
+            self._ensure_runs_column(connection, 'source_run_id', 'TEXT')
+            self._ensure_runs_column(connection, 'source_checkpoint_id', 'INTEGER')
+            self._ensure_runs_column(connection, 'resume_strategy', 'TEXT')
             connection.commit()
 
     @staticmethod
@@ -113,20 +157,50 @@ class SQLiteRunStore:
         input_payload: Any,
         session_id: str | None = None,
         run_kind: str = 'graph',
+        parent_run_id: str | None = None,
+        source_run_id: str | None = None,
+        source_checkpoint_id: int | None = None,
+        resume_strategy: str | None = None,
     ) -> None:
         self._event_sequences.setdefault(run_id, 0)
         with closing(self._connect()) as connection:
             connection.execute(
-                'INSERT INTO runs(run_id, graph_name, status, input_payload, created_at, session_id, run_kind) VALUES (?, ?, ?, ?, ?, ?, ?)',
-                (run_id, graph_name, 'running', self._encode(input_payload), self._now(), session_id, run_kind),
+                (
+                    'INSERT INTO runs('
+                    'run_id, graph_name, status, input_payload, created_at, session_id, run_kind, '
+                    'parent_run_id, source_run_id, source_checkpoint_id, resume_strategy'
+                    ') VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+                ),
+                (
+                    run_id,
+                    graph_name,
+                    RunStatus.RUNNING.value,
+                    self._encode(input_payload),
+                    self._now(),
+                    session_id,
+                    run_kind,
+                    parent_run_id,
+                    source_run_id,
+                    source_checkpoint_id,
+                    resume_strategy,
+                ),
             )
             connection.commit()
 
     def mark_run_running(self, run_id: str) -> None:
+        self._set_run_state(run_id, RunStatus.RUNNING, None)
+
+    def mark_run_waiting_approval(self, run_id: str, output_payload: Any) -> None:
+        self._set_run_state(run_id, RunStatus.WAITING_APPROVAL, output_payload)
+
+    def mark_run_interrupted(self, run_id: str, output_payload: Any) -> None:
+        self._set_run_state(run_id, RunStatus.INTERRUPTED, output_payload)
+
+    def _set_run_state(self, run_id: str, status: RunStatus, output_payload: Any) -> None:
         with closing(self._connect()) as connection:
             connection.execute(
                 'UPDATE runs SET status = ?, output_payload = ? WHERE run_id = ?',
-                ('running', None, run_id),
+                (status.value, self._encode(output_payload), run_id),
             )
             connection.commit()
 
@@ -141,7 +215,11 @@ class SQLiteRunStore:
     def load_run(self, run_id: str) -> dict[str, Any]:
         with closing(self._connect()) as connection:
             row = connection.execute(
-                'SELECT graph_name, status, input_payload, output_payload, created_at, session_id, run_kind FROM runs WHERE run_id = ?',
+                (
+                    'SELECT graph_name, status, input_payload, output_payload, created_at, session_id, run_kind, '
+                    'parent_run_id, source_run_id, source_checkpoint_id, resume_strategy '
+                    'FROM runs WHERE run_id = ?'
+                ),
                 (run_id,),
             ).fetchone()
         if row is None:
@@ -155,7 +233,32 @@ class SQLiteRunStore:
             'created_at': row[4],
             'session_id': row[5],
             'run_kind': row[6] or 'graph',
+            'parent_run_id': row[7],
+            'source_run_id': row[8],
+            'source_checkpoint_id': row[9],
+            'resume_strategy': row[10],
         }
+
+    def list_child_runs(self, run_id: str) -> list[dict[str, Any]]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                (
+                    'SELECT run_id, graph_name, status, created_at, source_checkpoint_id, resume_strategy '
+                    'FROM runs WHERE parent_run_id = ? ORDER BY created_at ASC'
+                ),
+                (run_id,),
+            ).fetchall()
+        return [
+            {
+                'run_id': row[0],
+                'graph_name': row[1],
+                'status': row[2],
+                'created_at': row[3],
+                'source_checkpoint_id': row[4],
+                'resume_strategy': row[5],
+            }
+            for row in rows
+        ]
 
     def record_node(
         self,
@@ -220,8 +323,9 @@ class SQLiteRunStore:
             )
             connection.commit()
         envelope = event.model_dump()
+        encoded_envelope = cast(str, self._encode(envelope))
         with (self.trace_path / f'{run_id}.jsonl').open('a', encoding='utf-8') as handle:
-            handle.write(self._encode(envelope) + '\n')
+            handle.write(encoded_envelope + '\n')
         self._broadcast_event(envelope)
         return envelope
 
@@ -288,13 +392,33 @@ class SQLiteRunStore:
             return {}
         return cast(dict[str, Any], self._decode(row[0]))
 
-    def create_checkpoint(self, run_id: str, kind: str, payload: Any) -> None:
+    def create_checkpoint(self, run_id: str, kind: str, payload: Any) -> int:
         with closing(self._connect()) as connection:
-            connection.execute(
+            cursor = connection.execute(
                 'INSERT INTO checkpoints(run_id, kind, payload, created_at) VALUES (?, ?, ?, ?)',
                 (run_id, kind, self._encode(payload), self._now()),
             )
             connection.commit()
+            if cursor.lastrowid is None:
+                raise RuntimeError('checkpoint insert did not return an id')
+            checkpoint_id = int(cursor.lastrowid)
+        return checkpoint_id
+
+    def list_checkpoints(self, run_id: str) -> list[dict[str, Any]]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                'SELECT checkpoint_id, kind, payload, created_at FROM checkpoints WHERE run_id = ? ORDER BY checkpoint_id ASC',
+                (run_id,),
+            ).fetchall()
+        return [
+            {
+                'checkpoint_id': row[0],
+                'kind': row[1],
+                'payload': self._decode(row[2]),
+                'created_at': row[3],
+            }
+            for row in rows
+        ]
 
     def load_latest_checkpoint(self, run_id: str) -> dict[str, Any] | None:
         with closing(self._connect()) as connection:
@@ -310,6 +434,212 @@ class SQLiteRunStore:
             'payload': self._decode(row[2]),
             'created_at': row[3],
         }
+
+    def load_checkpoint(self, run_id: str, checkpoint_id: int) -> dict[str, Any] | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                'SELECT checkpoint_id, kind, payload, created_at FROM checkpoints WHERE run_id = ? AND checkpoint_id = ?',
+                (run_id, checkpoint_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            'checkpoint_id': row[0],
+            'kind': row[1],
+            'payload': self._decode(row[2]),
+            'created_at': row[3],
+        }
+
+    def create_human_request(
+        self,
+        run_id: str,
+        request_key: str,
+        kind: str,
+        title: str,
+        payload: dict[str, Any],
+    ) -> HumanRequest:
+        existing = self.load_human_request_by_key(run_id, request_key)
+        if existing is not None:
+            return existing
+        request_id = uuid4().hex
+        created_at = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute(
+                (
+                    'INSERT INTO human_requests('
+                    'request_id, run_id, request_key, kind, status, title, payload, response_payload, created_at, resolved_at'
+                    ') VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+                ),
+                (
+                    request_id,
+                    run_id,
+                    request_key,
+                    kind,
+                    HumanRequestStatus.PENDING.value,
+                    title,
+                    self._encode(payload),
+                    None,
+                    created_at,
+                    None,
+                ),
+            )
+            connection.commit()
+        return HumanRequest(
+            request_id=request_id,
+            run_id=run_id,
+            request_key=request_key,
+            kind=kind,
+            status=HumanRequestStatus.PENDING,
+            title=title,
+            payload=payload,
+            response_payload=None,
+            created_at=created_at,
+            resolved_at=None,
+        )
+
+    def load_human_request(self, request_id: str) -> HumanRequest:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                (
+                    'SELECT run_id, request_key, kind, status, title, payload, response_payload, created_at, resolved_at '
+                    'FROM human_requests WHERE request_id = ?'
+                ),
+                (request_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(f'Human request not found: {request_id}')
+        return HumanRequest(
+            request_id=request_id,
+            run_id=row[0],
+            request_key=row[1],
+            kind=row[2],
+            status=HumanRequestStatus(row[3]),
+            title=row[4],
+            payload=cast(dict[str, Any], self._decode(row[5])),
+            response_payload=cast(dict[str, Any] | None, self._decode(row[6])),
+            created_at=row[7],
+            resolved_at=row[8],
+        )
+
+    def load_human_request_by_key(self, run_id: str, request_key: str) -> HumanRequest | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                'SELECT request_id FROM human_requests WHERE run_id = ? AND request_key = ?',
+                (run_id, request_key),
+            ).fetchone()
+        if row is None:
+            return None
+        return self.load_human_request(str(row[0]))
+
+    def list_human_requests(
+        self,
+        *,
+        status: HumanRequestStatus | None = None,
+        run_id: str | None = None,
+    ) -> list[HumanRequest]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status is not None:
+            clauses.append('status = ?')
+            params.append(status.value)
+        if run_id is not None:
+            clauses.append('run_id = ?')
+            params.append(run_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ''
+        query = (
+            'SELECT request_id FROM human_requests '
+            f'{where} ORDER BY created_at ASC'
+        )
+        with closing(self._connect()) as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [self.load_human_request(str(row[0])) for row in rows]
+
+    def resolve_human_request(
+        self,
+        request_id: str,
+        *,
+        status: HumanRequestStatus,
+        response_payload: dict[str, Any] | None = None,
+    ) -> HumanRequest:
+        resolved_at = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute(
+                'UPDATE human_requests SET status = ?, response_payload = ?, resolved_at = ? WHERE request_id = ?',
+                (status.value, self._encode(response_payload), resolved_at, request_id),
+            )
+            connection.commit()
+        return self.load_human_request(request_id)
+
+    def request_interrupt(self, run_id: str, payload: dict[str, Any] | None = None) -> None:
+        requested_at = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute(
+                'INSERT INTO interrupt_requests(run_id, payload, requested_at, consumed_at) VALUES (?, ?, ?, ?) '
+                'ON CONFLICT(run_id) DO UPDATE SET payload = excluded.payload, requested_at = excluded.requested_at, consumed_at = NULL',
+                (run_id, self._encode(payload or {}), requested_at, None),
+            )
+            connection.commit()
+
+    def consume_interrupt(self, run_id: str) -> dict[str, Any] | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                'SELECT payload FROM interrupt_requests WHERE run_id = ? AND consumed_at IS NULL',
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            payload = cast(dict[str, Any], self._decode(row[0]))
+            connection.execute(
+                'UPDATE interrupt_requests SET consumed_at = ? WHERE run_id = ?',
+                (self._now(), run_id),
+            )
+            connection.commit()
+        return payload
+
+    def save_oauth_tokens(self, server_name: str, payload: dict[str, Any] | None) -> None:
+        updated_at = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute(
+                'INSERT INTO oauth_state(server_name, tokens_payload, client_info_payload, updated_at) VALUES (?, ?, ?, ?) '
+                'ON CONFLICT(server_name) DO UPDATE SET tokens_payload = excluded.tokens_payload, updated_at = excluded.updated_at',
+                (server_name, self._encode(payload), None, updated_at),
+            )
+            connection.commit()
+
+    def load_oauth_tokens(self, server_name: str) -> dict[str, Any] | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                'SELECT tokens_payload FROM oauth_state WHERE server_name = ?',
+                (server_name,),
+            ).fetchone()
+        if row is None:
+            return None
+        return cast(dict[str, Any] | None, self._decode(row[0]))
+
+    def save_oauth_client_info(self, server_name: str, payload: dict[str, Any] | None) -> None:
+        updated_at = self._now()
+        with closing(self._connect()) as connection:
+            connection.execute(
+                'INSERT INTO oauth_state(server_name, tokens_payload, client_info_payload, updated_at) VALUES (?, ?, ?, ?) '
+                'ON CONFLICT(server_name) DO UPDATE SET client_info_payload = excluded.client_info_payload, updated_at = excluded.updated_at',
+                (server_name, None, self._encode(payload), updated_at),
+            )
+            connection.commit()
+
+    def load_oauth_client_info(self, server_name: str) -> dict[str, Any] | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                'SELECT client_info_payload FROM oauth_state WHERE server_name = ?',
+                (server_name,),
+            ).fetchone()
+        if row is None:
+            return None
+        return cast(dict[str, Any] | None, self._decode(row[0]))
+
+    def clear_oauth_state(self, server_name: str) -> None:
+        with closing(self._connect()) as connection:
+            connection.execute('DELETE FROM oauth_state WHERE server_name = ?', (server_name,))
+            connection.commit()
 
     def load_trace(self, run_id: str) -> dict[str, Any]:
         run_row = self.load_run(run_id)
@@ -341,6 +671,13 @@ class SQLiteRunStore:
             'input_payload': run_row['input_payload'],
             'output_payload': run_row['output_payload'],
             'created_at': run_row['created_at'],
+            'lineage': {
+                'parent_run_id': run_row['parent_run_id'],
+                'source_run_id': run_row['source_run_id'],
+                'source_checkpoint_id': run_row['source_checkpoint_id'],
+                'resume_strategy': run_row['resume_strategy'],
+                'child_runs': self.list_child_runs(run_id),
+            },
             'nodes': [
                 {
                     'node_id': row[0],
@@ -362,6 +699,7 @@ class SQLiteRunStore:
                 }
                 for row in checkpoint_rows
             ],
+            'human_requests': [item.model_dump() for item in self.list_human_requests(run_id=run_id)],
         }
 
     def _build_event(
@@ -379,7 +717,7 @@ class SQLiteRunStore:
         self._event_sequences[run_id] = sequence
         body = payload if isinstance(payload, dict) else {'value': payload}
         return RuntimeEvent(
-            event_id=uuid.uuid4().hex,
+            event_id=uuid4().hex,
             sequence=sequence,
             run_id=run_id,
             timestamp=self._now(),
@@ -402,7 +740,9 @@ class SQLiteRunStore:
         self._subscribers = active
 
     @staticmethod
-    def _encode(payload: Any) -> str:
+    def _encode(payload: Any) -> str | None:
+        if payload is None:
+            return None
         return json.dumps(payload, ensure_ascii=False)
 
     @staticmethod

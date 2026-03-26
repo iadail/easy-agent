@@ -29,6 +29,9 @@ skills:
 mcp:
   - name: filesystem
     transport: stdio
+    roots:
+      - path: .easy-agent/longrun/artifacts
+        name: longrun-artifacts
     command:
       - cmd
       - /c

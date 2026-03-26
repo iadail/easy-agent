@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_common.models import AssistantResponse, ChatMessage, Protocol, ToolCall, ToolSpec
+from agent_common.models import AssistantResponse, ChatMessage, HumanRequestStatus, Protocol, RunStatus, ToolCall, ToolSpec
 from agent_common.tools import ToolRegistry
 from agent_config.app import AppConfig, ModelConfig
 from agent_graph import AgentOrchestrator, GraphScheduler
@@ -261,8 +261,15 @@ async def test_swarm_team_handoff_switches_speaker(tmp_path: Path) -> None:
         },
     )
 
-    result = await scheduler.run('swarm task')
-    trace = scheduler.store.load_trace(result['run_id'])
+    waiting = await scheduler.run('swarm task')
+    request = scheduler.store.load_human_request(waiting['request_id'])
+
+    assert waiting['status'] == RunStatus.WAITING_APPROVAL.value
+    assert request.status is HumanRequestStatus.PENDING
+
+    scheduler.store.resolve_human_request(request.request_id, status=HumanRequestStatus.APPROVED)
+    result = await scheduler.resume(waiting['run_id'])
+    trace = scheduler.store.load_trace(waiting['run_id'])
 
     assert result['result']['terminated_by'] == 'finisher'
     assert result['result']['turns'][0]['handoff_target'] == 'finisher'

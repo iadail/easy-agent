@@ -3,14 +3,16 @@ from __future__ import annotations
 import json
 import re
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from agent_common.models import RunContext
+from agent_common.models import HumanLoopMode, RunContext, RunStatus
 from agent_config.app import AppConfig, HarnessConfig
 from agent_graph.orchestrator import AgentOrchestrator
 from agent_integrations.guardrails import GuardrailEngine
+from agent_integrations.human_loop import ApprovalRequired, HumanLoopManager, RunInterrupted
 from agent_integrations.storage import SQLiteRunStore
 
 
@@ -35,16 +37,24 @@ class HarnessRuntime:
         orchestrator: AgentOrchestrator,
         store: SQLiteRunStore,
         guardrail_engine: GuardrailEngine,
+        human_loop: HumanLoopManager | None = None,
     ) -> None:
         self.config = config
         self.orchestrator = orchestrator
         self.store = store
         self.guardrail_engine = guardrail_engine
+        self.human_loop = human_loop or HumanLoopManager(store, config.security.human_loop)
 
     def list_harnesses(self) -> list[HarnessConfig]:
         return list(self.config.harnesses)
 
-    async def run(self, name: str, input_text: str, session_id: str | None = None) -> dict[str, Any]:
+    async def run(
+        self,
+        name: str,
+        input_text: str,
+        session_id: str | None = None,
+        approval_mode: HumanLoopMode = HumanLoopMode.HYBRID,
+    ) -> dict[str, Any]:
         harness = self._get_harness(name)
         run_id = uuid.uuid4().hex
         self.store.create_run(
@@ -69,11 +79,102 @@ class HarnessRuntime:
             span_id=f'harness:{harness.name}',
             parent_span_id=f'run:{run_id}',
         )
+        return await self._execute_run(
+            run_id,
+            harness,
+            lambda: self._run_internal(harness, run_id, input_text, session_id, restored_state=None, approval_mode=approval_mode),
+        )
+
+    async def resume(
+        self,
+        run_id: str,
+        approval_mode: HumanLoopMode = HumanLoopMode.HYBRID,
+    ) -> dict[str, Any]:
+        run_payload = self.store.load_run(run_id)
+        if run_payload['run_kind'] != 'harness':
+            raise RuntimeError(f"Run '{run_id}' is not a harness run")
+        if run_payload['status'] == RunStatus.SUCCEEDED.value:
+            raise RuntimeError(f"Run '{run_id}' has already succeeded")
+        checkpoint = self.store.load_latest_checkpoint(run_id)
+        if checkpoint is None or checkpoint['kind'] != 'harness':
+            raise RuntimeError(f"Run '{run_id}' does not have a resumable harness checkpoint")
+        harness_name = str(checkpoint['payload'].get('harness'))
+        harness = self._get_harness(harness_name)
+        return await self._execute_run(
+            run_id,
+            harness,
+            lambda: self._resume_internal(run_id, harness, checkpoint, run_payload, approval_mode),
+        )
+
+    async def _resume_internal(
+        self,
+        run_id: str,
+        harness: HarnessConfig,
+        checkpoint: dict[str, Any],
+        run_payload: dict[str, Any],
+        approval_mode: HumanLoopMode,
+    ) -> dict[str, Any]:
+        if self.config.security.human_loop.approve_harness_resume:
+            context = RunContext(
+                run_id=run_id,
+                workdir=Path(checkpoint['payload'].get('state', {}).get('artifact_root', Path.cwd())),
+                node_id=None,
+                shared_state={},
+                session_id=run_payload['session_id'],
+                approval_mode=approval_mode,
+            )
+            await self.human_loop.require_approval(
+                context,
+                request_key=f'harness_resume:{run_id}:{checkpoint["checkpoint_id"]}',
+                kind='harness_resume',
+                title=f'Approve harness resume for {harness.name}',
+                payload={'run_id': run_id, 'harness': harness.name, 'checkpoint_id': checkpoint['checkpoint_id']},
+            )
+        self.store.mark_run_running(run_id)
+        self.store.record_event(
+            run_id,
+            'run_resumed',
+            {'checkpoint_kind': 'harness', 'harness': harness.name, 'checkpoint_id': checkpoint['checkpoint_id']},
+            scope='run',
+            span_id=f'run:{run_id}',
+        )
+        return await self._run_internal(
+            harness,
+            run_id,
+            str(checkpoint['payload'].get('input', run_payload['input_payload'].get('input', ''))),
+            run_payload['session_id'],
+            restored_state=dict(checkpoint['payload'].get('state', {})),
+            approval_mode=approval_mode,
+        )
+
+    async def _execute_run(self, run_id: str, harness: HarnessConfig, runner: Callable[[], Awaitable[dict[str, Any]]]) -> dict[str, Any]:
         try:
-            output = await self._run_internal(harness, run_id, input_text, session_id, restored_state=None)
+            output: dict[str, Any] = await runner()
+        except ApprovalRequired as exc:
+            waiting = {'run_id': run_id, 'status': RunStatus.WAITING_APPROVAL.value, 'request_id': exc.request.request_id}
+            self.store.mark_run_waiting_approval(run_id, waiting)
+            self.store.record_event(
+                run_id,
+                'run_waiting_approval',
+                waiting,
+                scope='run',
+                span_id=f'run:{run_id}',
+            )
+            return waiting
+        except RunInterrupted as exc:
+            interrupted = {'run_id': run_id, 'status': RunStatus.INTERRUPTED.value, 'payload': exc.payload}
+            self.store.mark_run_interrupted(run_id, interrupted)
+            self.store.record_event(
+                run_id,
+                'run_interrupted',
+                interrupted,
+                scope='run',
+                span_id=f'run:{run_id}',
+            )
+            return interrupted
         except Exception as exc:
             failure = {'error': str(exc), 'harness': harness.name}
-            self.store.finish_run(run_id, 'failed', failure)
+            self.store.finish_run(run_id, RunStatus.FAILED.value, failure)
             self.store.record_event(
                 run_id,
                 'harness_failed',
@@ -90,71 +191,7 @@ class HarnessRuntime:
                 span_id=f'run:{run_id}',
             )
             raise RuntimeError(f'Harness run {run_id} failed: {exc}') from exc
-        self.store.finish_run(run_id, 'succeeded', output)
-        self.store.record_event(
-            run_id,
-            'harness_succeeded',
-            {'harness': harness.name, 'result': output['result']},
-            scope='harness',
-            span_id=f'harness:{harness.name}',
-            parent_span_id=f'run:{run_id}',
-        )
-        self.store.record_event(
-            run_id,
-            'run_succeeded',
-            {'result': output},
-            scope='run',
-            span_id=f'run:{run_id}',
-        )
-        return output
-
-    async def resume(self, run_id: str) -> dict[str, Any]:
-        run_payload = self.store.load_run(run_id)
-        if run_payload['run_kind'] != 'harness':
-            raise RuntimeError(f"Run '{run_id}' is not a harness run")
-        if run_payload['status'] == 'succeeded':
-            raise RuntimeError(f"Run '{run_id}' has already succeeded")
-        checkpoint = self.store.load_latest_checkpoint(run_id)
-        if checkpoint is None or checkpoint['kind'] != 'harness':
-            raise RuntimeError(f"Run '{run_id}' does not have a resumable harness checkpoint")
-        harness_name = str(checkpoint['payload'].get('harness'))
-        harness = self._get_harness(harness_name)
-        self.store.mark_run_running(run_id)
-        self.store.record_event(
-            run_id,
-            'run_resumed',
-            {'checkpoint_kind': 'harness', 'harness': harness.name},
-            scope='run',
-            span_id=f'run:{run_id}',
-        )
-        try:
-            output = await self._run_internal(
-                harness,
-                run_id,
-                str(checkpoint['payload'].get('input', run_payload['input_payload'].get('input', ''))),
-                run_payload['session_id'],
-                restored_state=dict(checkpoint['payload'].get('state', {})),
-            )
-        except Exception as exc:
-            failure = {'error': str(exc), 'harness': harness.name}
-            self.store.finish_run(run_id, 'failed', failure)
-            self.store.record_event(
-                run_id,
-                'harness_failed',
-                failure,
-                scope='harness',
-                span_id=f'harness:{harness.name}',
-                parent_span_id=f'run:{run_id}',
-            )
-            self.store.record_event(
-                run_id,
-                'run_failed',
-                failure,
-                scope='run',
-                span_id=f'run:{run_id}',
-            )
-            raise RuntimeError(f'Harness run {run_id} resume failed: {exc}') from exc
-        self.store.finish_run(run_id, 'succeeded', output)
+        self.store.finish_run(run_id, RunStatus.SUCCEEDED.value, output)
         self.store.record_event(
             run_id,
             'harness_succeeded',
@@ -179,6 +216,7 @@ class HarnessRuntime:
         input_text: str,
         session_id: str | None,
         restored_state: dict[str, Any] | None,
+        approval_mode: HumanLoopMode,
     ) -> dict[str, Any]:
         state = dict(restored_state or {})
         if not state and session_id is not None:
@@ -188,8 +226,8 @@ class HarnessRuntime:
         state['input'] = input_text
         state['session_id'] = session_id
         if not state.get('initialized'):
-            state = await self._initialize(harness, run_id, input_text, session_id, state)
-        return await self._run_cycles(harness, run_id, input_text, session_id, state)
+            state = await self._initialize(harness, run_id, input_text, session_id, state, approval_mode)
+        return await self._run_cycles(harness, run_id, input_text, session_id, state, approval_mode)
 
     async def _initialize(
         self,
@@ -198,10 +236,11 @@ class HarnessRuntime:
         input_text: str,
         session_id: str | None,
         state: dict[str, Any],
+        approval_mode: HumanLoopMode,
     ) -> dict[str, Any]:
         self._ensure_artifacts(state)
         prompt = self._initializer_prompt(harness, input_text, state)
-        context = self._context(run_id, session_id, state, phase='initializer', cycle=0)
+        context = self._context(run_id, session_id, state, phase='initializer', cycle=0, approval_mode=approval_mode)
         summary = await self.orchestrator.run_agent(harness.initializer_agent, prompt, context)
         state['initialized'] = True
         state['status'] = 'running'
@@ -230,9 +269,12 @@ class HarnessRuntime:
         input_text: str,
         session_id: str | None,
         state: dict[str, Any],
+        approval_mode: HumanLoopMode,
     ) -> dict[str, Any]:
         while int(state.get('cycle_index', 1)) <= harness.max_cycles:
             cycle = int(state.get('cycle_index', 1))
+            cycle_context = self._context(run_id, session_id, state, phase='cycle', cycle=cycle, approval_mode=approval_mode)
+            await self.human_loop.check_interrupt(cycle_context, f'harness_cycle:{harness.name}:{cycle}')
             self.store.record_event(
                 run_id,
                 'harness_cycle_started',
@@ -241,12 +283,12 @@ class HarnessRuntime:
                 span_id=f'harness:{harness.name}:cycle:{cycle}',
                 parent_span_id=f'harness:{harness.name}',
             )
-            worker_result = await self._run_worker(harness, run_id, input_text, session_id, state, cycle)
+            worker_result = await self._run_worker(harness, run_id, input_text, session_id, state, cycle, approval_mode)
             worker_text = _stringify(worker_result)
             evaluation_text = await self.orchestrator.run_agent(
                 harness.evaluator_agent,
                 self._evaluator_prompt(harness, input_text, state, cycle, worker_text),
-                self._context(run_id, session_id, state, phase='evaluator', cycle=cycle),
+                self._context(run_id, session_id, state, phase='evaluator', cycle=cycle, approval_mode=approval_mode),
             )
             evaluation = self._parse_evaluation(_stringify(evaluation_text))
             history_entry = {
@@ -283,7 +325,7 @@ class HarnessRuntime:
                 refreshed = await self.orchestrator.run_agent(
                     harness.initializer_agent,
                     self._replan_prompt(harness, input_text, state, cycle, history_entry),
-                    self._context(run_id, session_id, state, phase='replan', cycle=cycle),
+                    self._context(run_id, session_id, state, phase='replan', cycle=cycle, approval_mode=approval_mode),
                 )
                 state['initializer_summary'] = _stringify(refreshed)
                 self.store.record_event(
@@ -313,9 +355,10 @@ class HarnessRuntime:
         session_id: str | None,
         state: dict[str, Any],
         cycle: int,
+        approval_mode: HumanLoopMode,
     ) -> Any:
         prompt = self._worker_prompt(harness, input_text, state, cycle)
-        context = self._context(run_id, session_id, state, phase='worker', cycle=cycle)
+        context = self._context(run_id, session_id, state, phase='worker', cycle=cycle, approval_mode=approval_mode)
         if harness.worker_target in self.config.agent_map:
             return await self.orchestrator.run_agent(harness.worker_target, prompt, context)
         return await self.orchestrator.run_team(harness.worker_target, prompt, context)
@@ -460,6 +503,7 @@ class HarnessRuntime:
         *,
         phase: str,
         cycle: int,
+        approval_mode: HumanLoopMode,
     ) -> RunContext:
         return RunContext(
             run_id=run_id,
@@ -475,6 +519,7 @@ class HarnessRuntime:
                 'features_path': state['features_path'],
             },
             session_id=session_id,
+            approval_mode=approval_mode,
         )
 
     def _initializer_prompt(self, harness: HarnessConfig, input_text: str, state: dict[str, Any]) -> str:

@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from agent_common.models import ChatMessage
+from agent_common.models import ChatMessage, HumanRequestStatus
 from agent_integrations.storage import SQLiteRunStore
 
 
@@ -53,3 +53,33 @@ def test_sqlite_run_store_persists_session_memory_and_checkpoints(tmp_path: Path
     assert checkpoint['payload']['remaining'] == ['node_b']
     assert trace['session_id'] == 'session-a'
     assert trace['checkpoints'][0]['kind'] == 'graph'
+
+
+def test_sqlite_run_store_tracks_human_requests_interrupts_and_oauth_state(tmp_path: Path) -> None:
+    store = SQLiteRunStore(tmp_path, 'state.db')
+    store.create_run('run_3', 'baseline', {'input': 'approve'})
+
+    request = store.create_human_request('run_3', 'tool:echo', 'tool', 'Approve echo', {'tool_name': 'python_echo'})
+    pending = store.load_human_request_by_key('run_3', 'tool:echo')
+    requests = store.list_human_requests(run_id='run_3')
+
+    assert pending is not None
+    assert pending.request_id == request.request_id
+    assert requests[0].status is HumanRequestStatus.PENDING
+
+    resolved = store.resolve_human_request(request.request_id, status=HumanRequestStatus.APPROVED, response_payload={'approved_by': 'tester'})
+    store.request_interrupt('run_3', {'reason': 'pause'})
+    first_interrupt = store.consume_interrupt('run_3')
+    second_interrupt = store.consume_interrupt('run_3')
+    store.save_oauth_client_info('remote', {'client_id': 'abc'})
+    store.save_oauth_tokens('remote', {'access_token': 'secret-token'})
+
+    trace = store.load_trace('run_3')
+
+    assert resolved.status is HumanRequestStatus.APPROVED
+    assert resolved.response_payload == {'approved_by': 'tester'}
+    assert first_interrupt == {'reason': 'pause'}
+    assert second_interrupt is None
+    assert store.load_oauth_client_info('remote') == {'client_id': 'abc'}
+    assert store.load_oauth_tokens('remote') == {'access_token': 'secret-token'}
+    assert trace['human_requests'][0]['status'] == HumanRequestStatus.APPROVED

@@ -55,6 +55,26 @@ class RuntimeEvent(BaseModel):
     node_id: str | None = None
 
 
+class RunStatus(StrEnum):
+    RUNNING = 'running'
+    WAITING_APPROVAL = 'waiting_approval'
+    INTERRUPTED = 'interrupted'
+    FAILED = 'failed'
+    SUCCEEDED = 'succeeded'
+
+
+class HumanLoopMode(StrEnum):
+    DEFERRED = 'deferred'
+    INLINE = 'inline'
+    HYBRID = 'hybrid'
+
+
+class HumanRequestStatus(StrEnum):
+    PENDING = 'pending'
+    APPROVED = 'approved'
+    REJECTED = 'rejected'
+
+
 class GuardrailDecision(BaseModel):
     outcome: Literal['allow', 'block']
     guardrail: str
@@ -85,6 +105,13 @@ class NodeStatus(StrEnum):
     SKIPPED = 'skipped'
 
 
+class McpAuthType(StrEnum):
+    NONE = 'none'
+    BEARER_ENV = 'bearer_env'
+    HEADER_ENV = 'header_env'
+    OAUTH = 'oauth'
+
+
 @dataclass(slots=True)
 class RunContext:
     run_id: str
@@ -93,3 +120,17 @@ class RunContext:
     shared_state: dict[str, Any] = field(default_factory=dict)
     depth: int = 0
     session_id: str | None = None
+    approval_mode: HumanLoopMode = HumanLoopMode.HYBRID
+
+
+class HumanRequest(BaseModel):
+    request_id: str
+    run_id: str
+    request_key: str
+    kind: str
+    status: HumanRequestStatus
+    title: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+    response_payload: dict[str, Any] | None = None
+    created_at: str
+    resolved_at: str | None = None

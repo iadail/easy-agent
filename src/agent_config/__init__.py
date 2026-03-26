@@ -5,7 +5,11 @@ from agent_config.app import (
     AppConfig,
     GraphConfig,
     GraphNodeConfig,
+    HarnessConfig,
+    HumanLoopConfig,
     LoggingConfig,
+    McpAuthConfig,
+    McpRootConfig,
     McpServerConfig,
     ModelConfig,
     SandboxConfig,
@@ -20,7 +24,11 @@ __all__ = [
     'AppConfig',
     'GraphConfig',
     'GraphNodeConfig',
+    'HarnessConfig',
+    'HumanLoopConfig',
     'LoggingConfig',
+    'McpAuthConfig',
+    'McpRootConfig',
     'McpServerConfig',
     'ModelConfig',
     'SandboxConfig',
@@ -29,5 +37,3 @@ __all__ = [
     'StorageConfig',
     'load_config',
 ]
-
-

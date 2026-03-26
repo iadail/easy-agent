@@ -7,6 +7,7 @@ from agent_common.models import ChatMessage, RunContext, ToolCall, ToolSpec
 from agent_common.tools import ToolHandler, ToolRegistry
 from agent_config.app import AgentConfig, AppConfig, TeamConfig
 from agent_integrations.guardrails import GuardrailEngine
+from agent_integrations.human_loop import HumanLoopManager
 from agent_integrations.storage import SQLiteRunStore
 from agent_integrations.tool_validation import normalize_and_validate_tool_arguments
 
@@ -40,12 +41,14 @@ class AgentOrchestrator:
         registry: ToolRegistry,
         store: SQLiteRunStore,
         guardrail_engine: GuardrailEngine,
+        human_loop: HumanLoopManager | None = None,
     ) -> None:
         self.config = config
         self.model_client = model_client
         self.registry = registry
         self.store = store
         self.guardrail_engine = guardrail_engine
+        self.human_loop = human_loop or HumanLoopManager(store, config.security.human_loop)
         self.agents: dict[str, AgentConfig] = config.agent_map
         self.teams: dict[str, TeamConfig] = config.team_map
 
@@ -67,6 +70,7 @@ class AgentOrchestrator:
                 shared_state=context.shared_state,
                 depth=context.depth + 1,
                 session_id=context.session_id,
+                approval_mode=context.approval_mode,
             )
             return await self.run_agent(target_name, prompt, next_context)
 
@@ -149,6 +153,7 @@ class AgentOrchestrator:
             )
             self._checkpoint_team(name, prompt, context, shared_messages, turns, current_speaker, start_turn, checkpointing)
         for turn_index in range(start_turn, team.max_turns + 1):
+            await self.human_loop.check_interrupt(context, f'team_turn:{name}:{turn_index}')
             if team.mode.value == 'round_robin':
                 speaker = team.members[(turn_index - 1) % len(team.members)]
             elif team.mode.value == 'selector':
@@ -175,8 +180,23 @@ class AgentOrchestrator:
             }
             turns.append(turn_payload)
             if result.handoff_target and team.mode.value == 'swarm':
-                current_speaker = result.handoff_target
                 handoff_message = result.handoff_message or f'Handoff from {speaker} to {result.handoff_target}.'
+                if self.config.security.human_loop.approve_handoffs:
+                    await self.human_loop.require_approval(
+                        context,
+                        request_key=f'handoff:{name}:{turn_index}:{self.human_loop.stable_key(speaker, result.handoff_target, handoff_message)}',
+                        kind='handoff',
+                        title=f'Approve handoff from {speaker} to {result.handoff_target}',
+                        payload={
+                            'team': name,
+                            'turn': turn_index,
+                            'from': speaker,
+                            'to': result.handoff_target,
+                            'message': handoff_message,
+                        },
+                    )
+                await self.human_loop.check_interrupt(context, f'team_handoff:{name}:{turn_index}')
+                current_speaker = result.handoff_target
                 shared_messages.append(
                     ChatMessage(
                         role='user',
@@ -301,6 +321,7 @@ class AgentOrchestrator:
         tool_specs.extend(self._handoff_spec(target) for target in handoff_targets)
         messages = [ChatMessage(role='system', content=agent.system_prompt), *shared_messages]
         for iteration in range(agent.max_iterations):
+            await self.human_loop.check_interrupt(context, f'agent_iteration:{name}:{iteration + 1}')
             agent_span = f'agent:{name}:iter:{iteration + 1}'
             self.store.record_event(
                 context.run_id,
@@ -369,7 +390,7 @@ class AgentOrchestrator:
                 )
             validation_repaired = False
             for tool_call in response.tool_calls:
-                executed = await self._execute_tool_call(tool_call, context, agent_span)
+                executed = await self._execute_tool_call(tool_call, context, agent_span, actor=name, iteration=iteration + 1)
                 if isinstance(executed, ChatMessage):
                     validation_repaired = True
                     messages.append(executed)
@@ -386,7 +407,15 @@ class AgentOrchestrator:
                 continue
         raise RuntimeError(f"Agent '{name}' exceeded max_iterations")
 
-    async def _execute_tool_call(self, tool_call: ToolCall, context: RunContext, parent_span_id: str) -> Any | ChatMessage:
+    async def _execute_tool_call(
+        self,
+        tool_call: ToolCall,
+        context: RunContext,
+        parent_span_id: str,
+        *,
+        actor: str,
+        iteration: int,
+    ) -> Any | ChatMessage:
         tool_spec = self.registry.get_spec(tool_call.name)
         validation = normalize_and_validate_tool_arguments(tool_spec.input_schema, tool_call.arguments)
         if validation.errors:
@@ -424,6 +453,24 @@ class AgentOrchestrator:
                 name=tool_call.name,
                 tool_call_id=tool_call.id,
             )
+        if self.human_loop.is_sensitive_tool(tool_call.name):
+            await self.human_loop.require_approval(
+                context,
+                request_key=(
+                    f'tool:{actor}:{iteration}:{tool_call.name}:'
+                    f'{self.human_loop.stable_key(validation.normalized, context.node_id)}'
+                ),
+                kind='tool',
+                title=f'Approve sensitive tool {tool_call.name}',
+                payload={
+                    'tool_name': tool_call.name,
+                    'arguments': validation.normalized,
+                    'actor': actor,
+                    'iteration': iteration,
+                    'node_id': context.node_id,
+                },
+            )
+        await self.human_loop.check_interrupt(context, f'tool_call:{tool_call.name}')
         decisions = self.guardrail_engine.check_tool_input(tool_call.name, validation.normalized, context)
         for decision in decisions:
             self.store.record_event(

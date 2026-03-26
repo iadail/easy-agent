@@ -6,11 +6,12 @@ from typing import Any
 
 import anyio
 
-from agent_common.models import ToolSpec
+from agent_common.models import HumanLoopMode, HumanRequestStatus, ToolSpec
 from agent_common.tools import ToolHandler, ToolRegistry
 from agent_config.app import AppConfig, McpServerConfig, load_config
 from agent_graph import AgentOrchestrator, GraphScheduler
 from agent_integrations.guardrails import GuardrailEngine
+from agent_integrations.human_loop import HumanLoopManager, InlineApprovalResolver
 from agent_integrations.mcp import McpClientManager, build_mcp_tool_name
 from agent_integrations.plugins import InlineRuntimePlugin, RuntimePlugin, RuntimePluginHost
 from agent_integrations.sandbox import SandboxManager, SandboxMode
@@ -30,6 +31,7 @@ class EasyAgentRuntime:
         sandbox_manager: SandboxManager,
         mcp_manager: McpClientManager,
         guardrail_engine: GuardrailEngine,
+        human_loop: HumanLoopManager,
         orchestrator: AgentOrchestrator,
         scheduler: GraphScheduler,
         harness_runtime: HarnessRuntime,
@@ -42,6 +44,7 @@ class EasyAgentRuntime:
         self.sandbox_manager = sandbox_manager
         self.mcp_manager = mcp_manager
         self.guardrail_engine = guardrail_engine
+        self.human_loop = human_loop
         self.orchestrator = orchestrator
         self.scheduler = scheduler
         self.harness_runtime = harness_runtime
@@ -60,6 +63,9 @@ class EasyAgentRuntime:
 
     def list_harnesses(self) -> list[Any]:
         return self.harness_runtime.list_harnesses()
+
+    def set_inline_approval_resolver(self, resolver: InlineApprovalResolver | None) -> None:
+        self.human_loop.set_inline_resolver(resolver)
 
     def register_skill_path(self, path: Path) -> list[SkillMetadata]:
         if self._started:
@@ -116,51 +122,32 @@ class EasyAgentRuntime:
                 )
                 self._bound_mcp_tools.add(registry_name)
 
-    async def run(self, input_text: str, session_id: str | None = None) -> dict[str, Any]:
+    async def run(
+        self,
+        input_text: str,
+        session_id: str | None = None,
+        approval_mode: HumanLoopMode = HumanLoopMode.HYBRID,
+    ) -> dict[str, Any]:
         if not self._started:
             await self.start()
-        return await self.scheduler.run(input_text, session_id=session_id)
+        return await self.scheduler.run(input_text, session_id=session_id, approval_mode=approval_mode)
 
-    async def run_harness(self, name: str, input_text: str, session_id: str | None = None) -> dict[str, Any]:
-        if not self._started:
-            await self.start()
-        return await self.harness_runtime.run(name, input_text, session_id=session_id)
-
-    async def stream(self, input_text: str, session_id: str | None = None) -> AsyncIterator[dict[str, Any]]:
-        if not self._started:
-            await self.start()
-        stream = self.store.subscribe_events()
-        result: dict[str, Any] | None = None
-        error: Exception | None = None
-        selected_run_id: str | None = None
-
-        async def _runner() -> None:
-            nonlocal result, error
-            try:
-                result = await self.scheduler.run(input_text, session_id=session_id)
-            except Exception as exc:
-                error = exc
-
-        async with anyio.create_task_group() as task_group:
-            task_group.start_soon(_runner)
-            async with stream:
-                async for event in stream:
-                    if selected_run_id is None and event['kind'] == 'run_started':
-                        selected_run_id = str(event['run_id'])
-                    if selected_run_id is None or event['run_id'] == selected_run_id:
-                        yield event
-                        if event['kind'] in {'run_succeeded', 'run_failed', 'run_interrupted'} and event['run_id'] == selected_run_id:
-                            break
-        if error is not None:
-            raise error
-        if result is not None:
-            return
-
-    async def stream_harness(
+    async def run_harness(
         self,
         name: str,
         input_text: str,
         session_id: str | None = None,
+        approval_mode: HumanLoopMode = HumanLoopMode.HYBRID,
+    ) -> dict[str, Any]:
+        if not self._started:
+            await self.start()
+        return await self.harness_runtime.run(name, input_text, session_id=session_id, approval_mode=approval_mode)
+
+    async def stream(
+        self,
+        input_text: str,
+        session_id: str | None = None,
+        approval_mode: HumanLoopMode = HumanLoopMode.HYBRID,
     ) -> AsyncIterator[dict[str, Any]]:
         if not self._started:
             await self.start()
@@ -172,7 +159,7 @@ class EasyAgentRuntime:
         async def _runner() -> None:
             nonlocal result, error
             try:
-                result = await self.harness_runtime.run(name, input_text, session_id=session_id)
+                result = await self.scheduler.run(input_text, session_id=session_id, approval_mode=approval_mode)
             except Exception as exc:
                 error = exc
 
@@ -184,24 +171,118 @@ class EasyAgentRuntime:
                         selected_run_id = str(event['run_id'])
                     if selected_run_id is None or event['run_id'] == selected_run_id:
                         yield event
-                        if event['kind'] in {'run_succeeded', 'run_failed', 'run_interrupted'} and event['run_id'] == selected_run_id:
+                        if event['kind'] in {'run_succeeded', 'run_failed', 'run_interrupted', 'run_waiting_approval'} and event['run_id'] == selected_run_id:
                             break
         if error is not None:
             raise error
         if result is not None:
             return
 
-    async def resume(self, run_id: str) -> dict[str, Any]:
+    async def stream_harness(
+        self,
+        name: str,
+        input_text: str,
+        session_id: str | None = None,
+        approval_mode: HumanLoopMode = HumanLoopMode.HYBRID,
+    ) -> AsyncIterator[dict[str, Any]]:
         if not self._started:
             await self.start()
-        return await self.scheduler.resume(run_id)
+        stream = self.store.subscribe_events()
+        result: dict[str, Any] | None = None
+        error: Exception | None = None
+        selected_run_id: str | None = None
 
-    async def resume_harness(self, run_id: str) -> dict[str, Any]:
+        async def _runner() -> None:
+            nonlocal result, error
+            try:
+                result = await self.harness_runtime.run(name, input_text, session_id=session_id, approval_mode=approval_mode)
+            except Exception as exc:
+                error = exc
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(_runner)
+            async with stream:
+                async for event in stream:
+                    if selected_run_id is None and event['kind'] == 'run_started':
+                        selected_run_id = str(event['run_id'])
+                    if selected_run_id is None or event['run_id'] == selected_run_id:
+                        yield event
+                        if event['kind'] in {'run_succeeded', 'run_failed', 'run_interrupted', 'run_waiting_approval'} and event['run_id'] == selected_run_id:
+                            break
+        if error is not None:
+            raise error
+        if result is not None:
+            return
+
+    async def resume(
+        self,
+        run_id: str,
+        checkpoint_id: int | None = None,
+        *,
+        fork: bool = False,
+        approval_mode: HumanLoopMode = HumanLoopMode.HYBRID,
+    ) -> dict[str, Any]:
         if not self._started:
             await self.start()
-        return await self.harness_runtime.resume(run_id)
+        return await self.scheduler.resume(run_id, checkpoint_id, fork=fork, approval_mode=approval_mode)
 
-    async def resume_stream(self, run_id: str) -> AsyncIterator[dict[str, Any]]:
+    async def replay(self, run_id: str, checkpoint_id: int) -> dict[str, Any]:
+        if not self._started:
+            await self.start()
+        return await self.scheduler.replay(run_id, checkpoint_id)
+
+    def list_checkpoints(self, run_id: str) -> list[dict[str, Any]]:
+        return self.scheduler.list_checkpoints(run_id)
+
+    async def resume_harness(
+        self,
+        run_id: str,
+        approval_mode: HumanLoopMode = HumanLoopMode.HYBRID,
+    ) -> dict[str, Any]:
+        if not self._started:
+            await self.start()
+        return await self.harness_runtime.resume(run_id, approval_mode=approval_mode)
+
+    async def resume_stream(
+        self,
+        run_id: str,
+        checkpoint_id: int | None = None,
+        *,
+        fork: bool = False,
+        approval_mode: HumanLoopMode = HumanLoopMode.HYBRID,
+    ) -> AsyncIterator[dict[str, Any]]:
+        if not self._started:
+            await self.start()
+        stream = self.store.subscribe_events()
+        error: Exception | None = None
+        target_run_id: str | None = None
+
+        async def _runner() -> None:
+            nonlocal error, target_run_id
+            try:
+                result = await self.scheduler.resume(run_id, checkpoint_id, fork=fork, approval_mode=approval_mode)
+                target_run_id = str(result['run_id'])
+            except Exception as exc:
+                error = exc
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(_runner)
+            async with stream:
+                async for event in stream:
+                    if target_run_id is None and event['kind'] == 'run_resumed':
+                        target_run_id = str(event['run_id'])
+                    if target_run_id is None or event['run_id'] == target_run_id:
+                        yield event
+                        if event['kind'] in {'run_succeeded', 'run_failed', 'run_interrupted', 'run_waiting_approval'}:
+                            break
+        if error is not None:
+            raise error
+
+    async def resume_harness_stream(
+        self,
+        run_id: str,
+        approval_mode: HumanLoopMode = HumanLoopMode.HYBRID,
+    ) -> AsyncIterator[dict[str, Any]]:
         if not self._started:
             await self.start()
         stream = self.store.subscribe_events()
@@ -210,7 +291,7 @@ class EasyAgentRuntime:
         async def _runner() -> None:
             nonlocal error
             try:
-                await self.scheduler.resume(run_id)
+                await self.harness_runtime.resume(run_id, approval_mode=approval_mode)
             except Exception as exc:
                 error = exc
 
@@ -220,34 +301,40 @@ class EasyAgentRuntime:
                 async for event in stream:
                     if event['run_id'] == run_id:
                         yield event
-                        if event['kind'] in {'run_succeeded', 'run_failed', 'run_interrupted'}:
+                        if event['kind'] in {'run_succeeded', 'run_failed', 'run_interrupted', 'run_waiting_approval'}:
                             break
         if error is not None:
             raise error
 
-    async def resume_harness_stream(self, run_id: str) -> AsyncIterator[dict[str, Any]]:
-        if not self._started:
-            await self.start()
-        stream = self.store.subscribe_events()
-        error: Exception | None = None
+    def list_human_requests(self, status: HumanRequestStatus | None = None, run_id: str | None = None) -> list[dict[str, Any]]:
+        return [item.model_dump() for item in self.store.list_human_requests(status=status, run_id=run_id)]
 
-        async def _runner() -> None:
-            nonlocal error
-            try:
-                await self.harness_runtime.resume(run_id)
-            except Exception as exc:
-                error = exc
+    def load_human_request(self, request_id: str) -> dict[str, Any]:
+        return self.store.load_human_request(request_id).model_dump()
 
-        async with anyio.create_task_group() as task_group:
-            task_group.start_soon(_runner)
-            async with stream:
-                async for event in stream:
-                    if event['run_id'] == run_id:
-                        yield event
-                        if event['kind'] in {'run_succeeded', 'run_failed', 'run_interrupted'}:
-                            break
-        if error is not None:
-            raise error
+    def approve_human_request(self, request_id: str, response_payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self.store.resolve_human_request(
+            request_id,
+            status=HumanRequestStatus.APPROVED,
+            response_payload=response_payload,
+        ).model_dump()
+
+    def reject_human_request(self, request_id: str, response_payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self.store.resolve_human_request(
+            request_id,
+            status=HumanRequestStatus.REJECTED,
+            response_payload=response_payload,
+        ).model_dump()
+
+    def interrupt_run(self, run_id: str, payload: dict[str, Any] | None = None) -> None:
+        self.store.request_interrupt(run_id, payload or {'reason': 'user requested interrupt'})
+        self.store.record_event(
+            run_id,
+            'interrupt_requested',
+            payload or {'reason': 'user requested interrupt'},
+            scope='human',
+            span_id=f'human:interrupt:{run_id}',
+        )
 
     async def aclose(self) -> None:
         await self.mcp_manager.aclose()
@@ -270,11 +357,12 @@ def build_runtime_from_config(config: AppConfig) -> EasyAgentRuntime:
         tool_input_hooks=config.guardrails.tool_input_hooks,
         final_output_hooks=config.guardrails.final_output_hooks,
     )
-    mcp_manager = McpClientManager([], sandbox_manager, store=store)
+    human_loop = HumanLoopManager(store, config.security.human_loop)
     model_client = HttpModelClient(config.model)
-    orchestrator = AgentOrchestrator(config, model_client, registry, store, guardrail_engine)
-    scheduler = GraphScheduler(config, registry, orchestrator, store, mcp_manager, guardrail_engine)
-    harness_runtime = HarnessRuntime(config, orchestrator, store, guardrail_engine)
+    mcp_manager = McpClientManager(config.mcp, sandbox_manager, store=store, model_client=model_client, human_loop=human_loop)
+    orchestrator = AgentOrchestrator(config, model_client, registry, store, guardrail_engine, human_loop)
+    scheduler = GraphScheduler(config, registry, orchestrator, store, mcp_manager, guardrail_engine, human_loop)
+    harness_runtime = HarnessRuntime(config, orchestrator, store, guardrail_engine, human_loop)
     runtime = EasyAgentRuntime(
         config,
         model_client,
@@ -283,6 +371,7 @@ def build_runtime_from_config(config: AppConfig) -> EasyAgentRuntime:
         sandbox_manager,
         mcp_manager,
         guardrail_engine,
+        human_loop,
         orchestrator,
         scheduler,
         harness_runtime,
@@ -291,8 +380,6 @@ def build_runtime_from_config(config: AppConfig) -> EasyAgentRuntime:
         runtime.load(plugin_source)
     if config.skills:
         runtime.load(InlineRuntimePlugin(skill_paths=[Path(item.path) for item in config.skills]))
-    if config.mcp:
-        runtime.load(InlineRuntimePlugin(mcp_servers=config.mcp))
     orchestrator.register_subagent_tools()
     return runtime
 

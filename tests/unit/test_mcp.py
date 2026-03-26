@@ -119,3 +119,27 @@ def test_build_mcp_tool_name_sanitizes_separator() -> None:
     assert build_mcp_tool_name('filesystem', 'read_text_file') == 'mcp__filesystem__read_text_file'
     assert build_mcp_tool_name('pg-server', 'query/sql') == 'mcp__pg-server__query_sql'
 
+
+
+@pytest.mark.asyncio
+async def test_mcp_manager_infers_filesystem_roots_from_stdio_command(tmp_path) -> None:
+    sandbox_manager = SandboxManager(
+        mode=SandboxMode.PROCESS,
+        targets=[SandboxTarget.STDIO_MCP],
+        env_allowlist=['PATH', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP'],
+    )
+    manager = McpClientManager(
+        [
+            McpServerConfig(
+                name='filesystem',
+                transport='stdio',
+                command=['cmd', '/c', 'npx', '-y', '@modelcontextprotocol/server-filesystem', str(tmp_path)],
+            )
+        ],
+        sandbox_manager,
+    )
+
+    roots = await manager.list_roots('filesystem')
+
+    assert roots[0]['path'] == str(tmp_path)
+    assert roots[0]['uri'].startswith('file:///')

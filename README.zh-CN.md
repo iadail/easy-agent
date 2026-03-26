@@ -30,7 +30,7 @@
 - 一个真正的一等公民长任务 harness：`initializer -> worker -> evaluator`，支持可恢复 checkpoints 和持久化工件。
 - 面向 `OpenAI`、`Anthropic`、`Gemini` 风格载荷的统一模型调用适配层。
 - 面向 Tool Calling 2.0 的统一执行层，能承接 direct tools、command skills、Python hook skills、MCP tools 和 plugin mounting。
-- 内置 session memory、event streaming、tracing、guardrails 和 public evaluation 工具。
+- 内置 session memory、event streaming、tracing、guardrails、human approval、replay 工具和 public evaluation 能力。
 
 ## 技术栈
 
@@ -61,7 +61,7 @@
       <strong>Integration</strong><br>
       <img alt="Tools" src="https://img.shields.io/badge/Tools-direct%20tools-0891B2"><br>
       <img alt="Skills" src="https://img.shields.io/badge/Skills-command%20%7C%20Python%20hook-F97316"><br>
-      <img alt="MCP" src="https://img.shields.io/badge/MCP-stdio%20%7C%20HTTP%2FSSE-DC2626"><br>
+      <img alt="MCP" src="https://img.shields.io/badge/MCP-stdio%20%7C%20HTTP%2FSSE%20%7C%20streamable__HTTP-DC2626"><br>
       <img alt="Plugins" src="https://img.shields.io/badge/Plugins-path%20%7C%20manifest%20%7C%20entry%20point-0EA5E9">
     </td>
   </tr>
@@ -73,23 +73,25 @@
 - 统一适配 `OpenAI`、`Anthropic`、`Gemini` 风格的模型请求与响应。
 - Tool Calling 2.0 运行时可同时承接 direct tools、command skills、Python hook skills、MCP tools 和 mounted plugins。
 - 支持 `single_agent`、`sub_agent`、`multi_agent_graph`、`Agent Teams` 多种协作模式。
-- 增加了一等公民的长任务 harness，具备持久化工件、显式 completion contract、由 evaluator 驱动的 continue 或 replan，以及 resumable checkpoints。
+- 增加了一等公民的长任务 harness，具备持久化工件、显式 completion contract、由 evaluator 驱动的 continue 或 replan、resumable checkpoints，以及带审批的人审恢复门。
 - 对直接运行、顶层 team 运行、harness 状态复用提供 session-oriented memory。
+- 对敏感工具、swarm handoff、harness resume、MCP sampling 与 elicitation 提供 human approval 和 safe-point interrupt。
 - 在工具执行前和最终输出前都有显式 guardrail hooks。
 - 对模型输出的工具参数做 schema-aware validation，并提供 repair loop。
 - tracing 与 event streaming 已覆盖 agent、team、tool、guardrail、harness、MCP 边界。
-- 使用 SQLite 与 JSONL 持久化 runs、traces、checkpoints、session state。
+- 使用 SQLite 与 JSONL 持久化 runs、traces、checkpoints、session state、harness state、approval requests、interrupts 和 resume lineage。
+- 为 graph 与 team workflow 提供历史 checkpoint 列表、time-travel replay，以及可分支的 `--fork` resume。
+- MCP 已支持 roots、sampling、elicitation、`streamable_http` 与带授权感知的远程传输，并持久化 OAuth state。
 - 内置 BFCL 子集与 tau2 mock 子集的 public evaluation 能力。
 
-## 未来规划
+## Human Loop、Replay 与 MCP
 
-下面这些内容是下一阶段希望补强的方向，重点是可靠性、安全性和互操作性，不代表仓库当前已经全部实现。
+这些能力现在已经是仓库的已实现功能，不再只是 roadmap 条目。
 
-- 在敏感工具执行、handoff 和长任务 checkpoint 恢复前增加 human approval 与 interrupt points。
-- 为 graph 与 team workflow 增加 time-travel replay 和可分支的 resume 能力。
-- 扩展 MCP 支持，补上 roots、sampling、elicitation 与带授权感知的远程传输能力。
-- 增加基于 A2A 风格协议的 remote agent federation。
-- 增强 executor / workbench 隔离层，用于长生命周期的代码执行、工具运行和环境任务。
+- 敏感工具在执行前可以进入人工审批，swarm handoff 与 harness resume 也会通过同一套 human loop 暂停。
+- 运行时暴露 safe-point interrupt、approval queue、checkpoint list、历史 replay，以及可分支的 `resume --fork` 恢复路径。
+- MCP 集成已支持显式 roots、针对 stdio filesystem server 的后向兼容 roots 推断、sampling callback、elicitation callback、`streamable_http`，以及带 OAuth 持久化状态的授权感知远程传输。
+- CLI 已提供 `approvals`、`checkpoints`、`replay`、`interrupt`、`mcp roots`、`mcp auth` 等命令，无需额外写胶水代码。
 
 ## 架构说明
 
@@ -176,7 +178,7 @@ flowchart TD
 - direct in-process tools
 - command skills
 - Python hook skills
-- `stdio` 或 `HTTP/SSE` 的 MCP tools
+- `stdio`、`HTTP/SSE` 或 `streamable_http` 的 MCP tools
 - 来自本地路径、manifest 或 entry point 的 mounted plugins
 
 ## 项目结构
@@ -235,10 +237,16 @@ uv run easy-agent skills list -c easy-agent.yml
 uv run easy-agent plugins list -c easy-agent.yml
 uv run easy-agent teams list -c configs/teams.example.yml
 uv run easy-agent harness list -c configs/harness.example.yml
-uv run easy-agent harness run delivery_loop "Create a release summary for this repository" -c configs/harness.example.yml --session-id demo-harness
-uv run easy-agent harness resume <run_id> -c configs/harness.example.yml
-uv run easy-agent run "summarize the repository" --session-id demo-session -c easy-agent.yml
-uv run easy-agent resume <run_id> -c configs/teams.example.yml
+uv run easy-agent run "summarize the repository" --session-id demo-session --approval-mode deferred -c easy-agent.yml
+uv run easy-agent approvals list --status pending -c easy-agent.yml
+uv run easy-agent checkpoints <run_id> -c configs/teams.example.yml
+uv run easy-agent replay <run_id> --checkpoint-id <checkpoint_id> -c configs/teams.example.yml
+uv run easy-agent resume <run_id> --checkpoint-id <checkpoint_id> --fork -c configs/teams.example.yml
+uv run easy-agent interrupt <run_id> --reason "human stop" -c configs/teams.example.yml
+uv run easy-agent harness run delivery_loop "Create a release summary for this repository" -c configs/harness.example.yml --session-id demo-harness --approval-mode deferred
+uv run easy-agent harness resume <run_id> -c configs/harness.example.yml --approval-mode deferred
+uv run easy-agent mcp roots list filesystem -c configs/longrun.example.yml
+uv run easy-agent mcp auth status filesystem -c configs/longrun.example.yml
 ```
 
 ### Python Runtime Example
@@ -280,13 +288,13 @@ uv run easy-agent teams list -c configs/teams.example.yml
 ## 设计参考
 
 - Anthropic, [Effective harnesses for long-running agents](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents)
-- OpenAI Agents SDK Sessions: <https://openai.github.io/openai-agents-python/sessions/>
-- OpenAI Agents SDK Handoffs: <https://openai.github.io/openai-agents-python/handoffs/>
-- OpenAI Agents SDK Guardrails: <https://openai.github.io/openai-agents-python/guardrails/>
-- OpenAI Agents SDK Tracing: <https://openai.github.io/openai-agents-python/tracing/>
-- AutoGen Teams: <https://microsoft.github.io/autogen/stable/user-guide/agentchat-user-guide/tutorial/teams.html>
-- LangGraph Durable Execution: <https://docs.langchain.com/oss/python/langgraph/durable-execution>
-- MCP Transports: <https://modelcontextprotocol.io/docs/concepts/transports>
+- OpenAI Agents SDK Sessions: [https://openai.github.io/openai-agents-python/sessions/](https://openai.github.io/openai-agents-python/sessions/)
+- OpenAI Agents SDK Handoffs: [https://openai.github.io/openai-agents-python/handoffs/](https://openai.github.io/openai-agents-python/handoffs/)
+- OpenAI Agents SDK Guardrails: [https://openai.github.io/openai-agents-python/guardrails/](https://openai.github.io/openai-agents-python/guardrails/)
+- OpenAI Agents SDK Tracing: [https://openai.github.io/openai-agents-python/tracing/](https://openai.github.io/openai-agents-python/tracing/)
+- AutoGen Teams: [https://microsoft.github.io/autogen/stable/user-guide/agentchat-user-guide/tutorial/teams.html](https://microsoft.github.io/autogen/stable/user-guide/agentchat-user-guide/tutorial/teams.html)
+- LangGraph Durable Execution: [https://docs.langchain.com/oss/python/langgraph/durable-execution](https://docs.langchain.com/oss/python/langgraph/durable-execution)
+- MCP Transports: [https://modelcontextprotocol.io/docs/concepts/transports](https://modelcontextprotocol.io/docs/concepts/transports)
 
 ## 致谢
 
@@ -295,4 +303,4 @@ uv run easy-agent teams list -c configs/teams.example.yml
 
 ## License
 
-MIT
+[Apache-2.0](https://github.com/CloudWide851/easy-agent?tab=Apache-2.0-1-ov-file#)

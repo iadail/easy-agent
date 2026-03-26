@@ -7,7 +7,7 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, Field, model_validator
 
-from agent_common.models import NodeType, Protocol, TeamMode
+from agent_common.models import HumanLoopMode, McpAuthType, NodeType, Protocol, TeamMode
 from agent_integrations.sandbox import SandboxMode, SandboxTarget
 
 _LOADED_ENV_FILES: set[Path] = set()
@@ -155,14 +155,52 @@ class SkillSourceConfig(BaseModel):
     path: str
 
 
+class McpRootConfig(BaseModel):
+    path: str
+    name: str | None = None
+
+
+class McpAuthConfig(BaseModel):
+    type: McpAuthType = McpAuthType.NONE
+    token_env: str | None = None
+    header_env: str | None = None
+    header_name: str = 'Authorization'
+    value_prefix: str = 'Bearer '
+    client_name: str = 'easy-agent'
+    redirect_uri: str = 'urn:ietf:wg:oauth:2.0:oob'
+    scopes: list[str] = Field(default_factory=list)
+
+    @model_validator(mode='after')
+    def validate_auth(self) -> McpAuthConfig:
+        if self.type is McpAuthType.BEARER_ENV and not self.token_env:
+            raise ValueError('bearer_env auth requires token_env')
+        if self.type is McpAuthType.HEADER_ENV and not self.header_env:
+            raise ValueError('header_env auth requires header_env')
+        return self
+
+
 class McpServerConfig(BaseModel):
     name: str
     transport: str
     command: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
+    url: str | None = None
     rpc_url: str | None = None
     sse_url: str | None = None
+    headers: dict[str, str] = Field(default_factory=dict)
+    roots: list[McpRootConfig] = Field(default_factory=list)
+    auth: McpAuthConfig = Field(default_factory=McpAuthConfig)
     timeout_seconds: float = 15.0
+
+    @model_validator(mode='after')
+    def validate_transport(self) -> McpServerConfig:
+        if self.transport == 'http_sse' and not self.rpc_url:
+            raise ValueError('http_sse transport requires rpc_url')
+        if self.transport == 'streamable_http' and not self.url:
+            raise ValueError('streamable_http transport requires url')
+        if self.transport not in {'stdio', 'http_sse', 'streamable_http'}:
+            raise ValueError(f'Unsupported MCP transport: {self.transport}')
+        return self
 
 
 class StorageConfig(BaseModel):
@@ -184,6 +222,16 @@ class GuardrailConfig(BaseModel):
 class ObservabilityConfig(BaseModel):
     enable_event_stream: bool = True
     stream_format: Literal['pretty', 'ndjson'] = 'pretty'
+
+
+class HumanLoopConfig(BaseModel):
+    mode: HumanLoopMode = HumanLoopMode.HYBRID
+    sensitive_tools: list[str] = Field(default_factory=list)
+    approve_handoffs: bool = True
+    approve_harness_resume: bool = True
+    approve_mcp_sampling: bool = True
+    approve_mcp_elicitation: bool = True
+    interruptible: bool = True
 
 
 class SandboxConfig(BaseModel):
@@ -210,6 +258,7 @@ class SandboxConfig(BaseModel):
 class SecurityConfig(BaseModel):
     allowed_commands: list[list[str]] = Field(default_factory=list)
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
+    human_loop: HumanLoopConfig = Field(default_factory=HumanLoopConfig)
 
 
 class AppConfig(BaseModel):
@@ -236,6 +285,10 @@ class AppConfig(BaseModel):
     @property
     def harness_map(self) -> dict[str, HarnessConfig]:
         return {harness.name: harness for harness in self.harnesses}
+
+    @property
+    def mcp_map(self) -> dict[str, McpServerConfig]:
+        return {server.name: server for server in self.mcp}
 
     @model_validator(mode='after')
     def validate_harnesses(self) -> AppConfig:
@@ -269,6 +322,8 @@ def load_config(path: str | Path) -> AppConfig:
     graph = expanded.setdefault('graph', {})
     graph.setdefault('teams', [])
     expanded.setdefault('harnesses', [])
+    security = expanded.setdefault('security', {})
+    security.setdefault('human_loop', {})
     return AppConfig.model_validate(expanded)
 
 

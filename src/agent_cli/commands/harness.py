@@ -7,11 +7,16 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from agent_cli.shared import with_runtime
+from agent_cli.shared import build_cli_inline_resolver, with_runtime
+from agent_common.models import HumanLoopMode
 from agent_runtime import EasyAgentRuntime
 
 console = Console()
 harness_app = typer.Typer(help='Inspect and run long-running harnesses.')
+
+
+def _approval_mode(value: str) -> HumanLoopMode:
+    return HumanLoopMode(value)
 
 
 @harness_app.command('list')
@@ -43,10 +48,14 @@ def run_harness(
     config: str = typer.Option('easy-agent.yml', '-c', '--config'),
     session_id: str | None = typer.Option(None, '--session-id', help='Optional explicit session id for resumable harness state.'),
     stream: str | None = typer.Option(None, '--stream', help='Optional stream format: pretty or ndjson.'),
+    approval_mode: str = typer.Option('hybrid', '--approval-mode', help='Approval mode: deferred, inline, or hybrid.'),
 ) -> None:
     async def _run(runtime: EasyAgentRuntime) -> None:
+        resolved_mode = _approval_mode(approval_mode)
+        if resolved_mode is not HumanLoopMode.DEFERRED:
+            runtime.set_inline_approval_resolver(build_cli_inline_resolver(console))
         if stream:
-            async for event in runtime.stream_harness(name, input_text, session_id=session_id):
+            async for event in runtime.stream_harness(name, input_text, session_id=session_id, approval_mode=resolved_mode):
                 if stream == 'ndjson':
                     console.print(json.dumps(event, ensure_ascii=False))
                 else:
@@ -55,7 +64,7 @@ def run_harness(
                         f"payload={json.dumps(event.get('payload', {}), ensure_ascii=False)}"
                     )
             return
-        result = await runtime.run_harness(name, input_text, session_id=session_id)
+        result = await runtime.run_harness(name, input_text, session_id=session_id, approval_mode=resolved_mode)
         console.print_json(json.dumps(result, ensure_ascii=False))
 
     asyncio.run(with_runtime(config, _run))
@@ -66,10 +75,14 @@ def resume_harness(
     run_id: str = typer.Argument(..., help='Existing harness run id to resume from the latest checkpoint.'),
     config: str = typer.Option('easy-agent.yml', '-c', '--config'),
     stream: str | None = typer.Option(None, '--stream', help='Optional stream format: pretty or ndjson.'),
+    approval_mode: str = typer.Option('hybrid', '--approval-mode', help='Approval mode: deferred, inline, or hybrid.'),
 ) -> None:
     async def _run(runtime: EasyAgentRuntime) -> None:
+        resolved_mode = _approval_mode(approval_mode)
+        if resolved_mode is not HumanLoopMode.DEFERRED:
+            runtime.set_inline_approval_resolver(build_cli_inline_resolver(console))
         if stream:
-            async for event in runtime.resume_harness_stream(run_id):
+            async for event in runtime.resume_harness_stream(run_id, approval_mode=resolved_mode):
                 if stream == 'ndjson':
                     console.print(json.dumps(event, ensure_ascii=False))
                 else:
@@ -78,7 +91,7 @@ def resume_harness(
                         f"payload={json.dumps(event.get('payload', {}), ensure_ascii=False)}"
                     )
             return
-        result = await runtime.resume_harness(run_id)
+        result = await runtime.resume_harness(run_id, approval_mode=resolved_mode)
         console.print_json(json.dumps(result, ensure_ascii=False))
 
     asyncio.run(with_runtime(config, _run))

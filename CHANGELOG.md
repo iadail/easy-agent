@@ -9,20 +9,22 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Added
 
-- Added a first-class `HarnessRuntime` for long-running work with explicit `initializer`, `worker`, and `evaluator` phases.
-- Added typed `harnesses` configuration with validation for initializer agents, evaluator agents, and agent or team worker targets.
-- Added resumable harness checkpoints and durable session-scoped harness state persistence.
-- Added CLI support for `easy-agent harness list`, `easy-agent harness run`, and `easy-agent harness resume`.
-- Added `configs/harness.example.yml` and `tests/integration/test_harness_real.py` for a concrete harness entrypoint and live DeepSeek smoke coverage.
-- Added unit coverage for harness initialization, resume, replan, team worker targets, config validation, storage persistence, and doctor output.
-- Added forward-looking README roadmap sections covering human approvals, time-travel resume, richer MCP support, A2A-style federation, and stronger executor isolation.
+- Added human-loop controls across the runtime with approval gates for sensitive tools, swarm handoffs, harness resume, MCP sampling, and MCP elicitation.
+- Added interrupt requests, waiting/interrupted run states, durable approval storage, and CLI approval management through `easy-agent approvals *`.
+- Added checkpoint listing, historical replay, and branchable `resume --fork` support for graph and team workflows, plus lineage tracking in SQLite traces.
+- Added richer MCP support for explicit roots, backward-compatible filesystem-root inference for stdio servers, `streamable_http`, auth-aware remote transports, OAuth state persistence, and `easy-agent mcp roots/auth *` commands.
+- Added unit coverage for human approvals, interrupts, replay/fork lineage, MCP root inference, and the new storage lifecycle paths.
 
 ### Changed
 
-- Reworked `easy-agent.yml` to include a baseline local harness example alongside the direct runtime entrypoint.
-- Rewrote both READMEs so they explain the project in plain language first and document the runtime layers, harness loop, protocols, and Tool Calling 2.0 model more clearly.
-- Clarified the runtime architecture around `scheduler`, `orchestrator`, `registry`, `storage`, `protocol adapters`, and the new `harness` layer.
-- Removed machine-specific Windows temp-path wording from the README set so tracked docs no longer expose local filesystem details.
+- Updated the harness runtime so approval-gated resume flows enter `waiting_approval` cleanly instead of failing outside the run-state wrapper.
+- Updated `configs/longrun.example.yml` to declare filesystem roots explicitly while keeping dynamic long-run output roots compatible with the new MCP root model.
+- Updated both READMEs to document the shipped human-loop, replay, branching resume, and richer MCP capabilities instead of leaving them in the roadmap.
+
+### Verified
+
+- `python -m pytest tests/unit -q` with `54 passed`
+- `python -m pytest tests/integration -m real -q` with `4 passed`
 
 ## [0.3.0] - 2026-03-26
 
