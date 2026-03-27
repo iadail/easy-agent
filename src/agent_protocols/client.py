@@ -33,10 +33,94 @@ class ProtocolAdapter(TypingProtocol):
 
 def _anthropic_tool(tool: ToolSpec) -> dict[str, Any]:
     return {
-        "name": tool.name,
-        "description": tool.description,
-        "input_schema": tool.input_schema,
+        'name': tool.name,
+        'description': tool.description,
+        'input_schema': tool.input_schema,
     }
+
+
+def _normalize_openai_type(value: Any) -> str:
+    if isinstance(value, list):
+        candidates = [_normalize_openai_type(item) for item in value]
+        non_null = [item for item in candidates if item != 'null']
+        if len(non_null) == 1:
+            return non_null[0]
+        if set(non_null).issubset({'integer', 'number'}):
+            return 'number'
+        if non_null:
+            return non_null[0]
+        return 'string'
+    schema_type = str(value or 'object')
+    if schema_type == 'dict':
+        return 'object'
+    if schema_type == 'tuple':
+        return 'array'
+    return schema_type
+
+
+def _collapse_openai_union(options: Any) -> dict[str, Any]:
+    if not isinstance(options, list):
+        return {'type': 'string'}
+    normalized_options = [_openai_safe_schema(item) for item in options if isinstance(item, dict)]
+    non_null = [item for item in normalized_options if item.get('type') != 'null']
+    if len(non_null) == 1:
+        return non_null[0]
+    candidate_types = {str(item.get('type', 'string')) for item in non_null}
+    if candidate_types.issubset({'integer', 'number'}):
+        return {'type': 'number'}
+    if candidate_types == {'boolean'}:
+        return {'type': 'boolean'}
+    if candidate_types == {'array'}:
+        return non_null[0] if non_null else {'type': 'array', 'items': {'type': 'string'}}
+    if candidate_types == {'object'}:
+        return non_null[0] if non_null else {'type': 'object', 'properties': {}}
+    if 'string' in candidate_types:
+        return {'type': 'string'}
+    if non_null:
+        return {'type': str(non_null[0].get('type', 'string'))}
+    return {'type': 'string'}
+
+
+def _openai_safe_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(schema)
+    for key in ('anyOf', 'oneOf', 'allOf'):
+        if key in normalized:
+            collapsed = _collapse_openai_union(normalized.get(key))
+            preserved = {name: value for name, value in normalized.items() if name not in {'anyOf', 'oneOf', 'allOf'}}
+            normalized = {**preserved, **collapsed}
+            break
+    if 'type' in normalized:
+        schema_type = _normalize_openai_type(normalized.get('type'))
+    elif 'properties' in normalized:
+        schema_type = 'object'
+    elif 'items' in normalized:
+        schema_type = 'array'
+    else:
+        schema_type = 'object'
+    normalized['type'] = schema_type
+    if schema_type == 'object':
+        raw_properties = normalized.get('properties')
+        properties = raw_properties if isinstance(raw_properties, dict) else {}
+        safe_properties: dict[str, Any] = {}
+        for key, value in properties.items():
+            safe_properties[key] = _openai_safe_schema(value) if isinstance(value, dict) else {'type': 'string'}
+        normalized['properties'] = safe_properties
+        required = normalized.get('required')
+        if isinstance(required, list):
+            normalized['required'] = [item for item in required if item in safe_properties]
+        else:
+            normalized.pop('required', None)
+        if 'additionalProperties' in normalized and not isinstance(normalized['additionalProperties'], bool):
+            normalized.pop('additionalProperties', None)
+    elif schema_type == 'array':
+        raw_items = normalized.get('items')
+        if isinstance(raw_items, dict):
+            normalized['items'] = _openai_safe_schema(raw_items)
+        else:
+            normalized['items'] = {'type': _normalize_openai_type(raw_items) if raw_items else 'string'}
+    for key in ['default', 'examples', 'title', '$schema', '$defs', 'definitions', 'format', 'nullable']:
+        normalized.pop(key, None)
+    return normalized
 
 
 class OpenAIAdapter:
@@ -44,15 +128,15 @@ class OpenAIAdapter:
 
     def matches(self, config: ModelConfig) -> bool:
         provider = config.provider.lower()
-        return any(token in provider for token in ("openai", "deepseek", "compatible"))
+        return any(token in provider for token in ('openai', 'deepseek', 'compatible'))
 
     def endpoint(self, config: ModelConfig) -> str:
         return f"{config.base_url.rstrip('/')}/chat/completions"
 
     def headers(self, config: ModelConfig, api_key: str) -> dict[str, str]:
         return {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
+            'Authorization': f'Bearer {api_key}',
+            'Content-Type': 'application/json',
             **config.extra_headers,
         }
 
@@ -64,19 +148,19 @@ class OpenAIAdapter:
     ) -> dict[str, Any]:
         payload_messages: list[dict[str, Any]] = []
         for message in messages:
-            item: dict[str, Any] = {"role": message.role, "content": message.content}
+            item: dict[str, Any] = {'role': message.role, 'content': message.content}
             if message.name:
-                item["name"] = message.name
+                item['name'] = message.name
             if message.tool_call_id:
-                item["tool_call_id"] = message.tool_call_id
+                item['tool_call_id'] = message.tool_call_id
             if message.tool_calls:
-                item["tool_calls"] = [
+                item['tool_calls'] = [
                     {
-                        "id": tool_call.id,
-                        "type": "function",
-                        "function": {
-                            "name": tool_call.name,
-                            "arguments": json.dumps(tool_call.arguments),
+                        'id': tool_call.id,
+                        'type': 'function',
+                        'function': {
+                            'name': tool_call.name,
+                            'arguments': json.dumps(tool_call.arguments),
                         },
                     }
                     for tool_call in message.tool_calls
@@ -84,39 +168,39 @@ class OpenAIAdapter:
             payload_messages.append(item)
 
         payload: dict[str, Any] = {
-            "model": config.model,
-            "messages": payload_messages,
-            "temperature": config.temperature,
-            "max_tokens": config.max_tokens,
+            'model': config.model,
+            'messages': payload_messages,
+            'temperature': config.temperature,
+            'max_tokens': config.max_tokens,
         }
         if tools:
-            payload["tools"] = [
+            payload['tools'] = [
                 {
-                    "type": "function",
-                    "function": {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.input_schema,
+                    'type': 'function',
+                    'function': {
+                        'name': tool.name,
+                        'description': tool.description,
+                        'parameters': _openai_safe_schema(tool.input_schema),
                     },
                 }
                 for tool in tools
             ]
-            payload["tool_choice"] = "auto"
+            payload['tool_choice'] = 'auto'
         return payload
 
     def parse_response(self, payload: dict[str, Any]) -> AssistantResponse:
-        message = payload["choices"][0]["message"]
+        message = payload['choices'][0]['message']
         tool_calls: list[ToolCall] = []
-        for item in message.get("tool_calls", []):
+        for item in message.get('tool_calls', []):
             tool_calls.append(
                 ToolCall(
-                    id=item["id"],
-                    name=item["function"]["name"],
-                    arguments=json.loads(item["function"].get("arguments", "{}")),
+                    id=item['id'],
+                    name=item['function']['name'],
+                    arguments=json.loads(item['function'].get('arguments', '{}')),
                 )
             )
         return AssistantResponse(
-            text=message.get("content") or "",
+            text=message.get('content') or '',
             tool_calls=tool_calls,
             protocol=self.protocol,
             raw=payload,
@@ -128,16 +212,16 @@ class AnthropicAdapter:
 
     def matches(self, config: ModelConfig) -> bool:
         provider = config.provider.lower()
-        return "anthropic" in provider or "claude" in config.model.lower()
+        return 'anthropic' in provider or 'claude' in config.model.lower()
 
     def endpoint(self, config: ModelConfig) -> str:
         return f"{config.base_url.rstrip('/')}/messages"
 
     def headers(self, config: ModelConfig, api_key: str) -> dict[str, str]:
         return {
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "Content-Type": "application/json",
+            'x-api-key': api_key,
+            'anthropic-version': '2023-06-01',
+            'Content-Type': 'application/json',
             **config.extra_headers,
         }
 
@@ -147,70 +231,70 @@ class AnthropicAdapter:
         messages: list[ChatMessage],
         tools: list[ToolSpec],
     ) -> dict[str, Any]:
-        system_parts = [message.content for message in messages if message.role == "system"]
+        system_parts = [message.content for message in messages if message.role == 'system']
         payload_messages: list[dict[str, Any]] = []
         for message in messages:
-            if message.role == "system":
+            if message.role == 'system':
                 continue
-            if message.role == "tool":
+            if message.role == 'tool':
                 payload_messages.append(
                     {
-                        "role": "user",
-                        "content": [
+                        'role': 'user',
+                        'content': [
                             {
-                                "type": "tool_result",
-                                "tool_use_id": message.tool_call_id or "",
-                                "content": message.content,
+                                'type': 'tool_result',
+                                'tool_use_id': message.tool_call_id or '',
+                                'content': message.content,
                             }
                         ],
                     }
                 )
                 continue
-            if message.role == "assistant" and message.tool_calls:
+            if message.role == 'assistant' and message.tool_calls:
                 content: list[dict[str, Any]] = []
                 if message.content:
-                    content.append({"type": "text", "text": message.content})
+                    content.append({'type': 'text', 'text': message.content})
                 for tool_call in message.tool_calls:
                     content.append(
                         {
-                            "type": "tool_use",
-                            "id": tool_call.id,
-                            "name": tool_call.name,
-                            "input": tool_call.arguments,
+                            'type': 'tool_use',
+                            'id': tool_call.id,
+                            'name': tool_call.name,
+                            'input': tool_call.arguments,
                         }
                     )
-                payload_messages.append({"role": "assistant", "content": content})
+                payload_messages.append({'role': 'assistant', 'content': content})
                 continue
-            payload_messages.append({"role": message.role, "content": message.content})
+            payload_messages.append({'role': message.role, 'content': message.content})
 
         payload: dict[str, Any] = {
-            "model": config.model,
-            "max_tokens": config.max_tokens,
-            "messages": payload_messages,
-            "temperature": config.temperature,
+            'model': config.model,
+            'max_tokens': config.max_tokens,
+            'messages': payload_messages,
+            'temperature': config.temperature,
         }
         if system_parts:
-            payload["system"] = "\n".join(system_parts)
+            payload['system'] = '\n'.join(system_parts)
         if tools:
-            payload["tools"] = [_anthropic_tool(tool) for tool in tools]
+            payload['tools'] = [_anthropic_tool(tool) for tool in tools]
         return payload
 
     def parse_response(self, payload: dict[str, Any]) -> AssistantResponse:
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []
-        for item in payload.get("content", []):
-            if item["type"] == "text":
-                text_parts.append(item["text"])
-            if item["type"] == "tool_use":
+        for item in payload.get('content', []):
+            if item['type'] == 'text':
+                text_parts.append(item['text'])
+            if item['type'] == 'tool_use':
                 tool_calls.append(
                     ToolCall(
-                        id=item["id"],
-                        name=item["name"],
-                        arguments=item.get("input", {}),
+                        id=item['id'],
+                        name=item['name'],
+                        arguments=item.get('input', {}),
                     )
                 )
         return AssistantResponse(
-            text="\n".join(text_parts).strip(),
+            text='\n'.join(text_parts).strip(),
             tool_calls=tool_calls,
             protocol=self.protocol,
             raw=payload,
@@ -222,13 +306,13 @@ class GeminiAdapter:
 
     def matches(self, config: ModelConfig) -> bool:
         provider = config.provider.lower()
-        return "gemini" in provider or "google" in provider
+        return 'gemini' in provider or 'google' in provider
 
     def endpoint(self, config: ModelConfig) -> str:
         return f"{config.base_url.rstrip('/')}/models/{config.model}:generateContent"
 
     def headers(self, config: ModelConfig, api_key: str) -> dict[str, str]:
-        return {"x-goog-api-key": api_key, "Content-Type": "application/json", **config.extra_headers}
+        return {'x-goog-api-key': api_key, 'Content-Type': 'application/json', **config.extra_headers}
 
     def build_payload(
         self,
@@ -236,20 +320,20 @@ class GeminiAdapter:
         messages: list[ChatMessage],
         tools: list[ToolSpec],
     ) -> dict[str, Any]:
-        system_parts = [message.content for message in messages if message.role == "system"]
+        system_parts = [message.content for message in messages if message.role == 'system']
         contents: list[dict[str, Any]] = []
         for message in messages:
-            if message.role == "system":
+            if message.role == 'system':
                 continue
-            if message.role == "tool":
+            if message.role == 'tool':
                 contents.append(
                     {
-                        "role": "user",
-                        "parts": [
+                        'role': 'user',
+                        'parts': [
                             {
-                                "functionResponse": {
-                                    "name": message.name or "",
-                                    "response": {"content": message.content},
+                                'functionResponse': {
+                                    'name': message.name or '',
+                                    'response': {'content': message.content},
                                 }
                             }
                         ],
@@ -258,28 +342,28 @@ class GeminiAdapter:
                 continue
             parts: list[dict[str, Any]] = []
             if message.content:
-                parts.append({"text": message.content})
+                parts.append({'text': message.content})
             for tool_call in message.tool_calls:
-                parts.append({"functionCall": {"name": tool_call.name, "args": tool_call.arguments}})
-            contents.append({"role": "model" if message.role == "assistant" else "user", "parts": parts})
+                parts.append({'functionCall': {'name': tool_call.name, 'args': tool_call.arguments}})
+            contents.append({'role': 'model' if message.role == 'assistant' else 'user', 'parts': parts})
 
         payload: dict[str, Any] = {
-            "contents": contents,
-            "generationConfig": {
-                "temperature": config.temperature,
-                "maxOutputTokens": config.max_tokens,
+            'contents': contents,
+            'generationConfig': {
+                'temperature': config.temperature,
+                'maxOutputTokens': config.max_tokens,
             },
         }
         if system_parts:
-            payload["systemInstruction"] = {"parts": [{"text": "\n".join(system_parts)}]}
+            payload['systemInstruction'] = {'parts': [{'text': '\n'.join(system_parts)}]}
         if tools:
-            payload["tools"] = [
+            payload['tools'] = [
                 {
-                    "functionDeclarations": [
+                    'functionDeclarations': [
                         {
-                            "name": tool.name,
-                            "description": tool.description,
-                            "parameters": tool.input_schema,
+                            'name': tool.name,
+                            'description': tool.description,
+                            'parameters': _openai_safe_schema(tool.input_schema),
                         }
                         for tool in tools
                     ]
@@ -288,23 +372,23 @@ class GeminiAdapter:
         return payload
 
     def parse_response(self, payload: dict[str, Any]) -> AssistantResponse:
-        parts = payload["candidates"][0]["content"]["parts"]
+        parts = payload['candidates'][0]['content']['parts']
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []
         for item in parts:
-            if "text" in item:
-                text_parts.append(item["text"])
-            if "functionCall" in item:
-                call = item["functionCall"]
+            if 'text' in item:
+                text_parts.append(item['text'])
+            if 'functionCall' in item:
+                call = item['functionCall']
                 tool_calls.append(
                     ToolCall(
-                        id=call.get("id", call["name"]),
-                        name=call["name"],
-                        arguments=call.get("args", {}),
+                        id=call.get('id', call['name']),
+                        name=call['name'],
+                        arguments=call.get('args', {}),
                     )
                 )
         return AssistantResponse(
-            text="\n".join(text_parts).strip(),
+            text='\n'.join(text_parts).strip(),
             tool_calls=tool_calls,
             protocol=self.protocol,
             raw=payload,
@@ -319,7 +403,7 @@ def resolve_protocol(config: ModelConfig) -> ProtocolAdapter:
         for adapter in ADAPTERS:
             if adapter.protocol is config.protocol:
                 return adapter
-        raise ValueError(f"Unsupported protocol: {config.protocol}")
+        raise ValueError(f'Unsupported protocol: {config.protocol}')
 
     for protocol in (Protocol.OPENAI, Protocol.ANTHROPIC, Protocol.GEMINI):
         for adapter in ADAPTERS:
@@ -341,7 +425,7 @@ class HttpModelClient:
     ) -> AssistantResponse:
         api_key = os.environ.get(self.config.api_key_env)
         if not api_key:
-            raise RuntimeError(f"Missing API key environment variable: {self.config.api_key_env}")
+            raise RuntimeError(f'Missing API key environment variable: {self.config.api_key_env}')
         payload = self.adapter.build_payload(self.config, messages, tools)
         headers = self.adapter.headers(self.config, api_key)
 
@@ -350,10 +434,8 @@ class HttpModelClient:
                 response = await self._client.post(self.adapter.endpoint(self.config), json=payload, headers=headers)
                 response.raise_for_status()
                 return self.adapter.parse_response(response.json())
-        raise RuntimeError("Model request did not complete")
+        raise RuntimeError('Model request did not complete')
 
     async def aclose(self) -> None:
         await self._client.aclose()
-
-
 

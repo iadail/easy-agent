@@ -145,3 +145,25 @@ async def test_mcp_manager_infers_filesystem_roots_from_stdio_command(tmp_path: 
     assert roots[0]['path'] == str(tmp_path)
     assert roots[0]['uri'].startswith('file:///')
 
+
+def test_stdio_filesystem_client_disables_server_roots_capability(tmp_path: Path) -> None:
+    sandbox_manager = SandboxManager(
+        mode=SandboxMode.PROCESS,
+        targets=[SandboxTarget.STDIO_MCP],
+        env_allowlist=['PATH', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP'],
+    )
+    manager = McpClientManager(
+        [
+            McpServerConfig(
+                name='filesystem',
+                transport='stdio',
+                command=['cmd', '/c', 'npx', '-y', '@modelcontextprotocol/server-filesystem', str(tmp_path)],
+            )
+        ],
+        sandbox_manager,
+    )
+
+    client = manager._clients['filesystem']
+
+    assert client._supports_server_roots() is False
+

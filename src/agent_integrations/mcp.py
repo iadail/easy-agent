@@ -269,6 +269,12 @@ class BaseMcpClient:
     def _root_payload(root: Any) -> dict[str, Any]:
         return {'path': root.path, 'name': root.name, 'uri': _root_to_uri(root.path)}
 
+    def _supports_server_roots(self) -> bool:
+        return not self._is_stdio_filesystem_server()
+
+    def _is_stdio_filesystem_server(self) -> bool:
+        return self.config.transport == 'stdio' and any('server-filesystem' in item for item in self.config.command)
+
 
 class SessionBackedMcpClient(BaseMcpClient):
     def __init__(
@@ -291,7 +297,7 @@ class SessionBackedMcpClient(BaseMcpClient):
             write_stream,
             sampling_callback=self._sampling_callback,
             elicitation_callback=self._elicitation_callback,
-            list_roots_callback=self._roots_callback,
+            list_roots_callback=self._roots_callback if self._supports_server_roots() else None,
         )
         self._session = await session.__aenter__()
         result = await self._session.initialize()
@@ -319,7 +325,7 @@ class SessionBackedMcpClient(BaseMcpClient):
         return [item.model_dump(by_alias=True, exclude_none=True) for item in result.content]
 
     async def refresh_roots(self) -> None:
-        if self._session is not None:
+        if self._session is not None and self._supports_server_roots():
             await self._session.send_roots_list_changed()
 
     async def authorize(self) -> None:

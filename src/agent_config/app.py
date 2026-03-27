@@ -191,6 +191,7 @@ class McpServerConfig(BaseModel):
     roots: list[McpRootConfig] = Field(default_factory=list)
     auth: McpAuthConfig = Field(default_factory=McpAuthConfig)
     timeout_seconds: float = 15.0
+    executor: str | None = None
 
     @model_validator(mode='after')
     def validate_transport(self) -> McpServerConfig:
@@ -271,10 +272,41 @@ class FederationConfig(BaseModel):
         return {item.name: item for item in self.exports}
 
 
+class ContainerExecutorOptions(BaseModel):
+    executable: str = 'podman'
+    image: str = 'docker.io/library/python:3.12-slim'
+    workdir: str = '/workspace'
+    keepalive_command: list[str] = Field(default_factory=lambda: ['sleep', 'infinity'])
+    run_args: list[str] = Field(default_factory=list)
+    exec_args: list[str] = Field(default_factory=list)
+
+
+class MicrovmExecutorOptions(BaseModel):
+    executable: str = 'qemu-system-x86_64'
+    base_image: str | None = None
+    ssh_user: str = 'agent'
+    ssh_private_key: str | None = None
+    guest_workdir: str = '/workspace'
+    ssh_port_base: int = 22000
+    memory_mb: int = 1024
+    cpus: int = 1
+    extra_args: list[str] = Field(default_factory=list)
+
+
 class ExecutorConfig(BaseModel):
     name: str = 'process'
-    kind: Literal['process'] = 'process'
+    kind: Literal['process', 'container', 'microvm'] = 'process'
     default_timeout_seconds: float = 30.0
+    container: ContainerExecutorOptions | None = None
+    microvm: MicrovmExecutorOptions | None = None
+
+    @model_validator(mode='after')
+    def validate_executor(self) -> ExecutorConfig:
+        if self.kind == 'container' and self.container is None:
+            raise ValueError(f"executor '{self.name}' requires container options")
+        if self.kind == 'microvm' and self.microvm is None:
+            raise ValueError(f"executor '{self.name}' requires microvm options")
+        return self
 
 
 class WorkbenchConfig(BaseModel):
@@ -418,6 +450,9 @@ class AppConfig(BaseModel):
             raise ValueError('executor names must be unique')
         if self.workbench.default_executor not in self.executor_map:
             raise ValueError('workbench.default_executor must reference a configured executor')
+        for server in self.mcp:
+            if server.executor is not None and server.executor not in self.executor_map:
+                raise ValueError(f"mcp server '{server.name}' references unknown executor '{server.executor}'")
         return self
 
     @model_validator(mode='after')
@@ -456,6 +491,4 @@ def load_config(path: str | Path) -> AppConfig:
 
 
 load_local_env()
-
-
 

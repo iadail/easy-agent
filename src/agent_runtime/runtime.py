@@ -10,6 +10,7 @@ from agent_common.models import HumanLoopMode, HumanRequestStatus, ToolSpec
 from agent_common.tools import ToolHandler, ToolRegistry
 from agent_config.app import AppConfig, FederationExportConfig, McpServerConfig, load_config
 from agent_graph import AgentOrchestrator, GraphScheduler
+from agent_integrations.executors import build_executor_backends
 from agent_integrations.federation import FederationClientManager, FederationServer
 from agent_integrations.guardrails import GuardrailEngine
 from agent_integrations.human_loop import HumanLoopManager, InlineApprovalResolver
@@ -446,6 +447,7 @@ class EasyAgentRuntime:
                 'branch_parent_session_id': item.branch_parent_session_id,
                 'expires_at': item.expires_at,
                 'metadata': item.metadata,
+                'runtime_state': item.runtime_state,
             }
             for item in self.workbench_manager.list_sessions(owner_run_id=owner_run_id)
         ]
@@ -481,7 +483,7 @@ def build_runtime_from_config(config: AppConfig) -> EasyAgentRuntime:
     store = SQLiteRunStore(Path(config.storage.path), config.storage.database)
     workbench_manager = WorkbenchManager(
         store,
-        sandbox_manager,
+        build_executor_backends(config.executors, sandbox_manager),
         Path(config.workbench.root),
         default_executor=config.workbench.default_executor,
         session_ttl_seconds=config.workbench.session_ttl_seconds,

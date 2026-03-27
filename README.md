@@ -6,7 +6,7 @@
 
 It is not a business-specific app. It is the runtime layer underneath one. The project gives you a stable place to run single agents, sub-agents, multi-agent graphs, teams, tools, skills, MCP servers, plugins, and now long-running harnesses without hard-coding product logic into the framework.
 
-Current release line: `0.3.x`. This snapshot documents patch release `0.3.1`.
+Current release line: `0.3.x`. This snapshot documents patch release `0.3.2`.
 
 ## What This Project Is
 
@@ -136,14 +136,17 @@ federation:
         type: bearer_env
         token_env: PARTNER_AGENT_TOKEN
 ```
+
 ## Executor / Workbench Isolation
 
 The runtime now has a dedicated executor or workbench layer for long-lived code execution, tool runs, and environment tasks.
 
-- `WorkbenchManager` provisions per-run isolated roots under `.easy-agent/workbench`.
-- Command skills and stdio MCP servers can reuse a long-lived workbench session instead of paying full environment setup cost on every call.
-- Graph and harness checkpoints now capture workbench manifests, and forked resume clones those manifests into new session roots.
-- SQLite persists `workbench_sessions`, `workbench_executions`, and federated task state for later inspection.
+- `WorkbenchManager` provisions per-run isolated roots under `.easy-agent/workbench` and persists backend runtime state alongside each session.
+- `executors` now support `process`, `container`, and `microvm` backends behind the same workbench interface.
+- Command skills and stdio MCP servers can opt into a named executor through `skill.metadata.executor` or `mcp[*].executor` and then reuse the same long-lived session.
+- Graph and harness checkpoints capture workbench manifests, and forked resume clones those manifests into new session roots without discarding the original lineage.
+- SQLite persists `workbench_sessions`, `workbench_executions`, runtime-state payloads, federated task state, and executor reuse metadata for later inspection.
+- The real-network suite now exercises process reuse directly and reports container or microVM rows as host-gated `skipped` until images and SSH assets are provisioned.
 - The CLI now exposes `easy-agent workbench list` and `easy-agent workbench gc`.
 
 ## Architecture
@@ -333,10 +336,14 @@ The repository currently uses these verification paths on this machine:
 .\.venv\Scripts\ruff.exe check src tests scripts
 .\.venv\Scripts\mypy.exe src tests scripts
 .\.venv\Scripts\python.exe -m pytest tests/unit -q --basetemp=%TEMP%\easy-agent-pytest\unit-full-<timestamp>
-.\.venv\Scripts\python.exe -m pytest tests/integration -m real -q --basetemp=%TEMP%\easy-agent-pytest\integration-real-<timestamp>
+.\.venv\Scripts\python.exe -m pytest tests/integration -m real -q --basetemp=%TEMP%\easy-agent-pytest\integration-full-<timestamp>
+.\.venv\Scripts\python.exe scripts\benchmark_modes.py --config easy-agent.yml --repeat 1 --output .easy-agent\benchmark-report.json
+.\.venv\Scripts\python.exe -  # helper script calling run_public_eval_suite('easy-agent.yml')
+.\.venv\Scripts\python.exe -  # helper script calling run_real_network_suite()
 ```
 
 Python CLI smoke is also verified through `CliRunner` against `agent_cli.app:app` for `--help`, `doctor`, `teams list`, `harness list`, and `federation list`.
+
 ## Real Network Test Set Results
 
 Snapshot date: March 27, 2026.
@@ -349,22 +356,39 @@ This snapshot was produced with Python `3.12.11`, local `.env.local` credentials
 | --- | --- | --- |
 | Static checks | `.\.venv\Scripts\ruff.exe check src tests scripts` | passed |
 | Typing | `.\.venv\Scripts\mypy.exe src tests scripts` | passed |
-| Unit tests | `.\.venv\Scripts\python.exe -m pytest tests/unit -q --basetemp=%TEMP%\easy-agent-pytest\unit-full-<timestamp>` | `65 passed` in `17.71s` |
-| Real integration tests | `.\.venv\Scripts\python.exe -m pytest tests/integration -m real -q --basetemp=%TEMP%\easy-agent-pytest\integration-real-<timestamp>` | `4 passed` in `573.75s` |
+| Unit tests | `.\.venv\Scripts\python.exe -m pytest tests/unit -q --basetemp=%TEMP%\easy-agent-pytest\unit-full-<timestamp>` | `74 passed` in `21.93s` |
+| Real integration tests | `.\.venv\Scripts\python.exe -m pytest tests/integration -m real -q --basetemp=%TEMP%\easy-agent-pytest\integration-full-<timestamp>` | `5 passed` in `554.53s` |
+| Live benchmark refresh | `.\.venv\Scripts\python.exe scripts\benchmark_modes.py --config easy-agent.yml --repeat 1 --output .easy-agent\benchmark-report.json` | report refreshed |
+| Live public-eval refresh | Python helper calling `run_public_eval_suite('easy-agent.yml')` | report refreshed |
+| Live real-network refresh | Python helper calling `run_real_network_suite()` | report refreshed |
 | Python CLI smoke | `CliRunner` against `agent_cli.app:app` for `--help`, `doctor`, `teams list`, `harness list`, `federation list` | passed |
+
+### Real Network Matrix
+
+| Scenario | Transport | Status | Duration (s) | Notes |
+| --- | --- | --- | --- | --- |
+| `cross_process_federation` | `http_poll` | passed | `1.6837` | cross-process send/poll federation passed |
+| `disconnect_retry_chaos` | `http_webhook` | passed | `4.9721` | callback retry, renew, cancel, and reconnect-style resubscribe flow passed |
+| `workbench_reuse_process` | `local_process` | passed | `1.6489` | process workbench reused the same long-lived session root |
+| `workbench_reuse_container` | `podman_exec` | skipped | `0.0000` | `EASY_AGENT_CONTAINER_IMAGE` is not set on this machine |
+| `workbench_reuse_microvm` | `qemu_ssh` | skipped | `0.0000` | `EASY_AGENT_QEMU_BASE_IMAGE` or `EASY_AGENT_QEMU_SSH_KEY` is not set on this machine |
+| `replay_resume_failure_injection` | `sqlite_checkpoint` | passed | `5.8592` | resume, replay, and fork recovery passed under injected failure |
+
+Summary: `4 passed`, `0 failed`, `2 skipped`.
+Source: `.easy-agent/real-network-report.json` generated at `2026-03-27T14:15:10Z`.
 
 ### Live Benchmark Snapshot
 
 | Mode | Success | Average Duration (s) |
 | --- | --- | --- |
-| `single_agent` | yes | `4.9189` |
-| `sub_agent` | yes | `15.9533` |
-| `multi_agent_graph` | yes | `13.4902` |
-| `team_round_robin` | yes | `7.7634` |
-| `team_selector` | yes | `26.4179` |
-| `team_swarm` | yes | `10.5093` |
+| `single_agent` | yes | `5.9261` |
+| `sub_agent` | yes | `18.7510` |
+| `multi_agent_graph` | yes | `15.8392` |
+| `team_round_robin` | yes | `12.9947` |
+| `team_selector` | yes | `16.9389` |
+| `team_swarm` | yes | `4.9341` |
 
-Source: `.easy-agent/benchmark-report.json` reused in this March 27, 2026 verification pass.
+Source: `.easy-agent/benchmark-report.json` regenerated during this March 27, 2026 `0.3.2` verification pass.
 
 ### Public Eval Snapshot
 
@@ -375,23 +399,27 @@ Source: `.easy-agent/benchmark-report.json` reused in this March 27, 2026 verifi
 | `bfcl_parallel_multiple` | `0.5000` | 2 of 4 cases passed |
 | `bfcl_irrelevance` | `0.0000` | 0 of 4 cases passed |
 | `tau2_mock` | `0.3333` | 1 of 3 cases passed |
-| `overall.bfcl_pass_rate` | `0.4583` | improved from the prior local `0.3333` snapshot |
+| `overall.bfcl_pass_rate` | `0.4583` | unchanged overall, but long-run MCP workflows no longer fail on the schema-driven `400` path |
 
 Source: `.easy-agent/public-eval-report.json` regenerated during the March 27, 2026 live verification pass.
 
 Current caveats:
 
 - The live suite still emits Windows `asyncio` subprocess cleanup warnings after completion, but the real tests and generated reports completed successfully.
-- DeepSeek's OpenAI-compatible endpoint still shows provider-side variance across BFCL irrelevance and tau2 history-sensitive cases, so the public-eval snapshot should be treated as a live compatibility reading rather than a stable leaderboard claim.
+- DeepSeek's OpenAI-compatible endpoint still returns provider-side `400 Bad Request` responses on a subset of BFCL multiple and irrelevance cases even after union-schema flattening; the harness and MCP-backed long-run workflows now pass end to end.
+- Container and microVM executor rows remain host-gated until `EASY_AGENT_CONTAINER_IMAGE`, `EASY_AGENT_QEMU_BASE_IMAGE`, and `EASY_AGENT_QEMU_SSH_KEY` are provisioned.
+
 ## Next Reinforcement
 
 These next steps are based on the current public A2A and MCP protocol surfaces, not just internal backlog notes.
 
-- Align federation discovery and lifecycle more closely with A2A well-known discovery plus richer push flows such as `pushNotification/set|get`, resumable subscriptions, and reconnect-friendly `sendSubscribe` or resubscribe behavior.
-- Extend card negotiation toward richer transport and security metadata, including `preferredTransport`, OpenAPI-style auth scheme hints, artifact or part-level multimodal declarations, and clearer compatibility negotiation for server-to-client notifications.
-- Expand MCP client feature negotiation with `roots/list_changed`, richer `elicitation` outcome handling, and stricter human-confirmed `sampling` policy enforcement so sensitive remote prompts stay approval-aware.
-- Add container or microVM executor backends behind the existing workbench interface for stronger isolation and reusable long-lived environments.
-- Extend the real-network evaluation matrix to cover cross-process federation, reconnect or retry chaos cases, long-lived workbench reuse, and replay or resume failure injection.
+- Align federation discovery and task delivery more closely with the public A2A surface, including well-known discovery, `pushNotification/set|get`, and reconnect-safe `sendSubscribe` or resubscribe behavior.
+- Extend federation card negotiation toward richer transport and security metadata, including clearer auth scheme hints, artifact or part-level modality declarations, and stricter compatibility negotiation for server-to-client notifications.
+- Expand MCP capability negotiation from basic roots support to full `roots/list_changed` flows plus stronger `streamable_http` reconnect and auth-refresh handling.
+- Make MCP sampling and elicitation policies more granular by separating low-risk and high-risk remote requests, and by supporting richer form or URL elicitation result handling without bypassing human approval.
+- Turn the current host-gated `container` and `microvm` executor backends into provisioned flows with image bootstrap, snapshot or restore, resource quotas, and repeatable real-host validation so those matrix rows move from `skipped` to exercised.
+- Extend the real-network suite with mixed live-model federation runs, duplicate-delivery or replay resilience checks, and real container or microVM reuse scenarios once host assets are available.
+
 ## Design References
 
 - Anthropic, [Effective harnesses for long-running agents](https://www.anthropic.com/engineering/effective-harnesses-for-long-running-agents)
@@ -416,13 +444,4 @@ These next steps are based on the current public A2A and MCP protocol surfaces, 
 ## License
 
 [Apache-2.0](https://github.com/CloudWide851/easy-agent?tab=Apache-2.0-1-ov-file#)
-
-
-
-
-
-
-
-
-
 

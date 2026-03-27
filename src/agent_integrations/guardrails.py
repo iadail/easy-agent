@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import re
 from collections.abc import Callable
@@ -55,7 +55,7 @@ class GuardrailEngine:
 
     def _block_shell_metacharacters(self, tool_name: str, arguments: dict[str, Any], context: RunContext) -> GuardrailDecision:
         del context
-        lowered_text = ' '.join(_iter_strings(arguments)).lower()
+        lowered_text = ' '.join(self._shell_relevant_strings(tool_name, arguments)).lower()
         patterns = ['&&', '||', ';', '`', 'rm -rf', 'shutdown', 'format c:', 'del /f', 'powershell -enc']
         for pattern in patterns:
             if pattern in lowered_text:
@@ -71,6 +71,18 @@ class GuardrailEngine:
             reason=f"tool '{tool_name}' input passed shell-token scan",
             payload={'tool_name': tool_name},
         )
+
+    @staticmethod
+    def _shell_relevant_strings(tool_name: str, arguments: dict[str, Any]) -> list[str]:
+        command_like_names = ('command', 'shell', 'terminal', 'exec', 'bash', 'powershell', 'cmd')
+        if any(token in tool_name.lower() for token in command_like_names):
+            return _iter_strings(arguments)
+        relevant_keys = {'command', 'commands', 'cmd', 'argv', 'args', 'script', 'shell', 'executable'}
+        values: list[str] = []
+        for key, value in arguments.items():
+            if key.lower() in relevant_keys:
+                values.extend(_iter_strings(value))
+        return values
 
     @staticmethod
     def _require_non_empty_output(output: Any, context: RunContext) -> GuardrailDecision:
@@ -137,5 +149,4 @@ def _stringify_output(output: Any) -> str:
     if isinstance(output, (list, tuple)):
         return ' '.join(_iter_strings(list(output)))
     return str(output)
-
 

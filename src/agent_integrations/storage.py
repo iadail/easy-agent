@@ -143,6 +143,7 @@ class SQLiteRunStore:
                     executor_name TEXT NOT NULL,
                     status TEXT NOT NULL,
                     metadata_payload TEXT NOT NULL,
+                    runtime_state_payload TEXT NOT NULL,
                     branch_parent_session_id TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -205,13 +206,18 @@ class SQLiteRunStore:
             self._ensure_runs_column(connection, 'source_run_id', 'TEXT')
             self._ensure_runs_column(connection, 'source_checkpoint_id', 'INTEGER')
             self._ensure_runs_column(connection, 'resume_strategy', 'TEXT')
+            self._ensure_table_column(connection, 'workbench_sessions', 'runtime_state_payload', "TEXT NOT NULL DEFAULT '{}'" )
             connection.commit()
 
     @staticmethod
     def _ensure_runs_column(connection: sqlite3.Connection, column_name: str, column_type: str) -> None:
-        columns = {row[1] for row in connection.execute('PRAGMA table_info(runs)').fetchall()}
+        SQLiteRunStore._ensure_table_column(connection, 'runs', column_name, column_type)
+
+    @staticmethod
+    def _ensure_table_column(connection: sqlite3.Connection, table_name: str, column_name: str, column_type: str) -> None:
+        columns = {row[1] for row in connection.execute(f'PRAGMA table_info({table_name})').fetchall()}
         if column_name not in columns:
-            connection.execute(f'ALTER TABLE runs ADD COLUMN {column_name} {column_type}')
+            connection.execute(f'ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}')
 
     def create_run(
         self,
@@ -713,6 +719,7 @@ class SQLiteRunStore:
         root_path: str,
         executor_name: str,
         metadata: dict[str, Any] | None,
+        runtime_state: dict[str, Any] | None,
         expires_at: str | None,
         branch_parent_session_id: str | None = None,
     ) -> None:
@@ -721,9 +728,9 @@ class SQLiteRunStore:
             connection.execute(
                 (
                     'INSERT INTO workbench_sessions('
-                    'session_id, owner_run_id, name, root_path, executor_name, status, metadata_payload, '
+                    'session_id, owner_run_id, name, root_path, executor_name, status, metadata_payload, runtime_state_payload, '
                     'branch_parent_session_id, created_at, updated_at, expires_at'
-                    ') VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
+                    ') VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)'
                 ),
                 (
                     session_id,
@@ -733,6 +740,7 @@ class SQLiteRunStore:
                     executor_name,
                     'active',
                     self._encode(metadata or {}),
+                    self._encode(runtime_state or {}),
                     branch_parent_session_id,
                     now,
                     now,
@@ -745,7 +753,7 @@ class SQLiteRunStore:
         with closing(self._connect()) as connection:
             row = connection.execute(
                 (
-                    'SELECT owner_run_id, name, root_path, executor_name, status, metadata_payload, '
+                    'SELECT owner_run_id, name, root_path, executor_name, status, metadata_payload, runtime_state_payload, '
                     'branch_parent_session_id, created_at, updated_at, expires_at '
                     'FROM workbench_sessions WHERE session_id = ?'
                 ),
@@ -761,10 +769,11 @@ class SQLiteRunStore:
             'executor_name': row[3],
             'status': row[4],
             'metadata': cast(dict[str, Any], self._decode(row[5]) or {}),
-            'branch_parent_session_id': row[6],
-            'created_at': row[7],
-            'updated_at': row[8],
-            'expires_at': row[9],
+            'runtime_state': cast(dict[str, Any], self._decode(row[6]) or {}),
+            'branch_parent_session_id': row[7],
+            'created_at': row[8],
+            'updated_at': row[9],
+            'expires_at': row[10],
         }
 
     def load_workbench_session_by_owner(self, owner_run_id: str, name: str) -> dict[str, Any] | None:
@@ -788,20 +797,44 @@ class SQLiteRunStore:
             rows = connection.execute(query, params).fetchall()
         return [self.load_workbench_session(str(row[0])) for row in rows]
 
-    def touch_workbench_session(self, session_id: str, expires_at: str | None) -> None:
+    def touch_workbench_session(
+        self,
+        session_id: str,
+        expires_at: str | None,
+        *,
+        runtime_state: dict[str, Any] | None = None,
+    ) -> None:
         with closing(self._connect()) as connection:
-            connection.execute(
-                'UPDATE workbench_sessions SET updated_at = ?, expires_at = ? WHERE session_id = ?',
-                (self._now(), expires_at, session_id),
-            )
+            if runtime_state is None:
+                connection.execute(
+                    'UPDATE workbench_sessions SET updated_at = ?, expires_at = ? WHERE session_id = ?',
+                    (self._now(), expires_at, session_id),
+                )
+            else:
+                connection.execute(
+                    'UPDATE workbench_sessions SET updated_at = ?, expires_at = ?, runtime_state_payload = ? WHERE session_id = ?',
+                    (self._now(), expires_at, self._encode(runtime_state), session_id),
+                )
             connection.commit()
 
-    def update_workbench_session_status(self, session_id: str, status: str) -> None:
+    def update_workbench_session_status(
+        self,
+        session_id: str,
+        status: str,
+        *,
+        runtime_state: dict[str, Any] | None = None,
+    ) -> None:
         with closing(self._connect()) as connection:
-            connection.execute(
-                'UPDATE workbench_sessions SET status = ?, updated_at = ? WHERE session_id = ?',
-                (status, self._now(), session_id),
-            )
+            if runtime_state is None:
+                connection.execute(
+                    'UPDATE workbench_sessions SET status = ?, updated_at = ? WHERE session_id = ?',
+                    (status, self._now(), session_id),
+                )
+            else:
+                connection.execute(
+                    'UPDATE workbench_sessions SET status = ?, updated_at = ?, runtime_state_payload = ? WHERE session_id = ?',
+                    (status, self._now(), self._encode(runtime_state), session_id),
+                )
             connection.commit()
 
     def record_workbench_execution(
@@ -1165,9 +1198,4 @@ class SQLiteRunStore:
             'UPDATE sessions SET graph_name = ?, updated_at = ? WHERE session_id = ?',
             (graph_name, updated_at, session_id),
         )
-
-
-
-
-
 

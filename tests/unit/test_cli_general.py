@@ -14,6 +14,10 @@ class FakeWorkbenchManager:
             'default_executor': 'process',
             'session_ttl_seconds': 3600,
             'active_sessions': 0,
+            'executors': {
+                'process': {'available': True},
+                'containerized': {'available': False},
+            },
         }
 
 
@@ -114,7 +118,7 @@ def test_doctor_rows_include_runtime_stack_details() -> None:
 
     assert rows['Provider'] == 'deepseek'
     assert rows['Model'] == 'deepseek-chat'
-    assert rows['Runtime Version'] == '0.3.1'
+    assert rows['Runtime Version'] == '0.3.2'
     assert rows['Entrypoint'] == 'writer_team'
     assert rows['Entrypoint Type'] == 'team'
     assert rows['Harnesses'] == '1'
@@ -123,9 +127,10 @@ def test_doctor_rows_include_runtime_stack_details() -> None:
     assert rows['Federation Remotes'] == '0'
     assert rows['Federation Exports'] == '0'
     assert rows['Federation Push'] == 'polling, webhook_subscribe, sse_events'
+    assert rows['Configured Executors'] == '2'
+    assert rows['Executor Availability'] == 'process:yes, containerized:no'
     assert rows['Tool Guardrails'] == 'block_shell_metacharacters'
     assert rows['Output Guardrails'] == 'require_non_empty_output, block_secret_leaks'
     assert rows['Event Stream'] == 'True'
     assert rows['Sandbox Fallback'] == 'process'
-
 

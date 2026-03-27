@@ -4,6 +4,8 @@ import sqlite3
 import sys
 from pathlib import Path
 
+from agent_config.app import ExecutorConfig
+from agent_integrations.executors import build_executor_backends
 from agent_integrations.sandbox import SandboxManager, SandboxMode, SandboxTarget
 from agent_integrations.storage import SQLiteRunStore
 from agent_integrations.workbench import WorkbenchManager
@@ -17,7 +19,12 @@ def _manager(tmp_path: Path) -> tuple[SQLiteRunStore, WorkbenchManager]:
         env_allowlist=['PATH', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'TEMP', 'TMP'],
         working_root=tmp_path,
     )
-    manager = WorkbenchManager(store, sandbox, tmp_path / 'workbench', session_ttl_seconds=1)
+    manager = WorkbenchManager(
+        store,
+        build_executor_backends([ExecutorConfig(name='process', kind='process')], sandbox),
+        tmp_path / 'workbench',
+        session_ttl_seconds=1,
+    )
     return store, manager
 
 
@@ -67,3 +74,13 @@ def test_workbench_gc_expires_sessions(tmp_path: Path) -> None:
 
     assert session.session_id in removed
     assert not session.root_path.exists()
+
+
+
+def test_workbench_session_persists_runtime_state(tmp_path: Path) -> None:
+    _, manager = _manager(tmp_path)
+    session = manager.ensure_session('run-e', 'skill-state')
+    loaded = manager.load_session(session.session_id)
+
+    assert loaded.executor_name == 'process'
+    assert loaded.runtime_state == {}

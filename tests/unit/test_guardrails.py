@@ -58,3 +58,10 @@ def test_guardrail_blocks_secret_like_final_output() -> None:
     decisions = engine.check_final_output('DEEPSEEK_API_KEY=sk-abcdef1234567890', build_context())
 
     assert any(item.outcome == 'block' for item in decisions)
+
+
+def test_guardrail_ignores_plain_text_tools_with_shell_like_punctuation() -> None:
+    engine = GuardrailEngine()
+    decisions = engine.check_tool_input('python_echo', {'prompt': 'Summarize alpha; beta; gamma.'}, build_context())
+
+    assert decisions[0].outcome == 'allow'

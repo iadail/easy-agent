@@ -58,3 +58,50 @@ def test_openai_parses_tool_calls() -> None:
     assert response.tool_calls[0].arguments["prompt"] == "hello"
 
 
+
+
+def test_openai_adapter_sanitizes_non_standard_schema_types() -> None:
+    adapter = OpenAIAdapter()
+    payload = adapter.build_payload(
+        ModelConfig(provider='deepseek', protocol=Protocol.OPENAI),
+        [ChatMessage(role='user', content='hello')],
+        [
+            ToolSpec(
+                name='complex_tool',
+                description='Complex',
+                input_schema={
+                    'type': 'dict',
+                    'properties': {
+                        'items': {
+                            'type': 'tuple',
+                            'items': {'type': 'dict', 'properties': {'value': {'type': 'integer'}}},
+                        },
+                        'value': {
+                            'anyOf': [
+                                {'type': 'string', 'format': 'binary'},
+                                {'type': 'integer'},
+                                {'type': 'null'},
+                            ]
+                        },
+                        'params': {
+                            'type': 'array',
+                            'items': {'type': ['string', 'number', 'boolean', 'null']},
+                        },
+                    },
+                    'required': ['items', 'missing'],
+                    'examples': ['drop-me'],
+                },
+            )
+        ],
+    )
+
+    schema = payload['tools'][0]['function']['parameters']
+    assert schema['type'] == 'object'
+    assert schema['properties']['items']['type'] == 'array'
+    assert schema['properties']['items']['items']['type'] == 'object'
+    assert schema['properties']['value']['type'] == 'string'
+    assert 'format' not in schema['properties']['value']
+    assert schema['properties']['params']['items']['type'] == 'string'
+    assert schema['required'] == ['items']
+    assert 'examples' not in schema
+

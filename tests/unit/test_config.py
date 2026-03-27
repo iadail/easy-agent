@@ -248,3 +248,51 @@ def test_workbench_validation_rejects_unknown_executor() -> None:
                 'workbench': {'default_executor': 'missing-executor'},
             }
         )
+
+
+def test_executor_validation_accepts_container_and_microvm() -> None:
+    config = AppConfig.model_validate(
+        {
+            'graph': {
+                'entrypoint': 'planner',
+                'agents': [{'name': 'planner'}],
+                'teams': [],
+                'nodes': [],
+            },
+            'executors': [
+                {'name': 'process', 'kind': 'process'},
+                {
+                    'name': 'containerized',
+                    'kind': 'container',
+                    'container': {'executable': 'podman', 'image': 'busybox'},
+                },
+                {
+                    'name': 'microvm-qemu',
+                    'kind': 'microvm',
+                    'microvm': {'executable': 'qemu-system-x86_64', 'base_image': 'base.qcow2'},
+                },
+            ],
+            'mcp': [{'name': 'filesystem', 'transport': 'stdio', 'executor': 'containerized'}],
+        }
+    )
+
+    assert config.executor_map['containerized'].kind == 'container'
+    assert config.executor_map['microvm-qemu'].kind == 'microvm'
+    assert config.mcp_map['filesystem'].executor == 'containerized'
+
+
+
+def test_executor_validation_rejects_unknown_mcp_executor() -> None:
+    with pytest.raises(ValueError, match='references unknown executor'):
+        AppConfig.model_validate(
+            {
+                'graph': {
+                    'entrypoint': 'planner',
+                    'agents': [{'name': 'planner'}],
+                    'teams': [],
+                    'nodes': [],
+                },
+                'executors': [{'name': 'process', 'kind': 'process'}],
+                'mcp': [{'name': 'filesystem', 'transport': 'stdio', 'executor': 'missing'}],
+            }
+        )

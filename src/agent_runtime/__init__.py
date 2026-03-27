@@ -17,6 +17,7 @@ from agent_runtime.longrun import (
     run_longrun_suite,
 )
 from agent_runtime.public_eval import PublicEvalRecord, run_public_eval_suite
+from agent_runtime.real_network_eval import RealNetworkRecord, run_real_network_suite
 from agent_runtime.runtime import EasyAgentRuntime, build_runtime, build_runtime_from_config
 
 __all__ = [
@@ -26,6 +27,7 @@ __all__ = [
     'HarnessRuntime',
     'LongRunRecord',
     'PublicEvalRecord',
+    'RealNetworkRecord',
     'build_default_cases',
     'build_longrun_cases',
     'build_longrun_report',
@@ -36,5 +38,6 @@ __all__ = [
     'run_default_suite',
     'run_longrun_suite',
     'run_public_eval_suite',
+    'run_real_network_suite',
     'summarize_trace',
 ]

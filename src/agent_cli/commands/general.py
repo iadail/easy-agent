@@ -46,6 +46,10 @@ def _doctor_rows(runtime: Any) -> list[tuple[str, str]]:
     human_loop = runtime.config.security.human_loop
     workbench = runtime.workbench_manager.describe()
     federation = runtime.config.federation
+    executor_summary = ', '.join(
+        f"{name}:{'yes' if item['available'] else 'no'}"
+        for name, item in workbench.get('executors', {}).items()
+    ) or 'none'
     return [
         ('Python', sys.version.split()[0]),
         ('Platform', platform.platform()),
@@ -75,6 +79,8 @@ def _doctor_rows(runtime: Any) -> list[tuple[str, str]]:
         ('Windows Sandbox', str(sandbox['windows_sandbox_available'])),
         ('Sandbox Fallback', sandbox['windows_sandbox_fallback']),
         ('Workbench Root', workbench['base_root']),
+        ('Configured Executors', str(len(workbench.get('executors', {})))),
+        ('Executor Availability', executor_summary),
         ('Workbench Executor', workbench['default_executor']),
         ('Workbench Sessions', str(workbench['active_sessions'])),
         ('Storage', str(runtime.store.base_path.resolve())),

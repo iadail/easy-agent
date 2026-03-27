@@ -94,6 +94,7 @@ def test_sqlite_run_store_tracks_workbench_and_federated_tasks(tmp_path: Path) -
         root_path=str(tmp_path / 'workbench' / 'wb-1'),
         executor_name='process',
         metadata={'kind': 'skill'},
+        runtime_state={'status': 'running'},
         expires_at='2099-01-01T00:00:00+00:00',
     )
     store.record_workbench_execution(
@@ -110,6 +111,8 @@ def test_sqlite_run_store_tracks_workbench_and_federated_tasks(tmp_path: Path) -
     federated = store.load_federated_task('task-1')
 
     assert workbench['name'] == 'skill-echo'
+    assert workbench['runtime_state']['status'] == 'running'
+    assert workbench['runtime_state']['status'] == 'running'
     assert store.list_workbench_sessions(owner_run_id='run-4')[0]['session_id'] == 'wb-1'
     assert federated['status'] == 'succeeded'
     assert federated['response_payload'] == {'result': 'done'}

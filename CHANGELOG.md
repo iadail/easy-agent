@@ -7,6 +7,39 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-03-27
+
+### Added
+
+- Added `src/agent_integrations/executors.py` with named `process`, `container`, and `microvm` executor backends for long-lived workbench sessions.
+- Added durable workbench runtime-state persistence so executor session metadata survives reuse, garbage collection, and forked resume flows.
+- Added `src/agent_runtime/real_network_eval.py` plus `tests/integration/test_real_network_eval.py` to publish a real-network matrix covering:
+  - cross-process federation
+  - disconnect/retry chaos
+  - process workbench reuse
+  - host-gated container reuse
+  - host-gated microVM reuse
+  - replay/resume failure injection
+
+### Changed
+
+- Hardened OpenAI-compatible tool-schema sanitization to flatten `anyOf`/`oneOf`, list-typed `type`, and format-heavy MCP schemas before sending tool definitions to provider endpoints.
+- Narrowed the shell-metacharacter guardrail so plain-text tools such as `python_echo` are not blocked by punctuation-only content.
+- Adjusted MCP roots negotiation so stdio filesystem servers fall back to their configured allowed directories instead of advertising an incompatible server-roots capability.
+- Updated both READMEs to stay synchronized for release `0.3.2`, publish the refreshed real-network matrix, refreshed benchmark/public-eval snapshots, and expand `Next Reinforcement` around current A2A/MCP protocol surfaces.
+
+### Verified
+
+- `.\.venv\Scripts\ruff.exe check src tests scripts`
+- `.\.venv\Scripts\mypy.exe src tests scripts`
+- `.\.venv\Scripts\python.exe -m pytest tests/unit -q --basetemp=%TEMP%\easy-agent-pytest\unit-full-<timestamp>` with `74 passed`
+- `.\.venv\Scripts\python.exe -m pytest tests/integration -m real -q --basetemp=%TEMP%\easy-agent-pytest\integration-full-<timestamp>` with `5 passed`
+- `.\.venv\Scripts\python.exe scripts\benchmark_modes.py --config easy-agent.yml --repeat 1 --output .easy-agent\benchmark-report.json`
+- Python helper scripts refreshed:
+  - `.easy-agent/public-eval-report.json`
+  - `.easy-agent/real-network-report.json`
+- Python CLI smoke remained covered through `CliRunner` for `--help`, `doctor`, `teams list`, `harness list`, and `federation list`
+
 ## [0.3.1] - 2026-03-27
 
 ### Added

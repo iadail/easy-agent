@@ -62,7 +62,7 @@ def _bfcl_system_prompt() -> str:
 def _tau_system_prompt() -> str:
     return (
         'You are a precise task assistant. Use the provided task-management tools when the user requests an action. '
-        'Acknowledge successful completion concisely. If previous conversation state is present, continue from it.'
+        'Acknowledge successful completion concisely. If previous conversation state is present, continue from it and infer task ids from prior tool outputs instead of asking again.'
     )
 
 
