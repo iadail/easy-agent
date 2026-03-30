@@ -5,16 +5,70 @@ import json
 import re
 import tempfile
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from statistics import mean
 from typing import Any, cast
 
+import httpx
+
 from agent_common.models import ChatMessage, ToolCall, ToolSpec
+from agent_common.schema_utils import normalize_json_schema
 from agent_config.app import AppConfig, load_config
 from agent_runtime.runtime import build_runtime_from_config
 
 FIXTURE_ROOT = Path(__file__).resolve().parents[2] / 'public_evals' / 'fixtures'
+_GENERIC_TOKENS = {
+    'a',
+    'all',
+    'also',
+    'an',
+    'and',
+    'base',
+    'based',
+    'calculate',
+    'calculates',
+    'can',
+    'data',
+    'date',
+    'default',
+    'determine',
+    'find',
+    'for',
+    'from',
+    'get',
+    'given',
+    'if',
+    'in',
+    'is',
+    'its',
+    'just',
+    'like',
+    'me',
+    'needed',
+    'of',
+    'on',
+    'or',
+    'please',
+    'properties',
+    'property',
+    'retrieve',
+    'retrieves',
+    'specific',
+    'the',
+    'their',
+    'there',
+    'these',
+    'this',
+    'to',
+    'true',
+    'units',
+    'using',
+    'what',
+    'which',
+    'with',
+}
+_MULTI_INTENT_PATTERN = re.compile(r'\b(also|both|as well as|in addition)\b', re.IGNORECASE)
 
 
 @dataclass(slots=True)
@@ -29,6 +83,16 @@ class PublicEvalRecord:
     actual_call_count: int
     result_summary: str
     error: str | None = None
+    fallback_stage: str = 'base'
+    fallback_attempts: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class _BfclAttemptResult:
+    record: PublicEvalRecord | None = None
+    error: Exception | None = None
+    duration_seconds: float = 0.0
+    retryable_provider_400: bool = False
 
 
 def _shared_payload(base: AppConfig) -> dict[str, Any]:
@@ -86,43 +150,11 @@ def _sanitize_tool_name(name: str) -> str:
 
 
 def _normalize_schema(schema: dict[str, Any]) -> dict[str, Any]:
-    normalized = dict(schema)
-    variant = None
-    for key in ('anyOf', 'oneOf', 'allOf'):
-        options = normalized.get(key)
-        if isinstance(options, list) and options:
-            variant = next((item for item in options if isinstance(item, dict) and item.get('type') != 'null'), options[0])
-            normalized.pop(key, None)
-            break
-    if isinstance(variant, dict):
-        merged = dict(variant)
-        if 'description' not in merged and 'description' in normalized:
-            merged['description'] = normalized['description']
-        normalized = merged
-    schema_type = normalized.get('type', '')
-    if isinstance(schema_type, list):
-        schema_type = next((item for item in schema_type if item != 'null'), schema_type[0] if schema_type else '')
-    schema_type = str(schema_type)
-    if schema_type == 'dict':
-        normalized['type'] = 'object'
-    elif schema_type == 'tuple':
-        normalized['type'] = 'array'
-    elif schema_type:
-        normalized['type'] = schema_type
-    for noisy_key in ('format', 'default', 'examples', 'title', '$schema', '$defs', 'nullable'):
-        normalized.pop(noisy_key, None)
-    if normalized.get('type') == 'object':
-        properties = cast(dict[str, Any], normalized.get('properties', {}))
-        normalized['properties'] = {
-            key: _normalize_schema(value) if isinstance(value, dict) else value for key, value in properties.items()
-        }
-        required = normalized.get('required')
-        if isinstance(required, list):
-            normalized['required'] = [str(item) for item in required if str(item) in normalized['properties']]
-    items = normalized.get('items')
-    if isinstance(items, dict):
-        normalized['items'] = _normalize_schema(items)
-    return normalized
+    return normalize_json_schema(schema)
+
+
+def _strict_normalize_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    return normalize_json_schema(schema, drop_descriptions=True, core_only=True)
 
 
 def _build_tool_name_map(functions: list[dict[str, Any]]) -> dict[str, str]:
@@ -266,21 +298,141 @@ def _summarize_result(result: Any) -> str:
     return json.dumps(result, ensure_ascii=False)[:200]
 
 
-async def _run_bfcl_case(base_config: AppConfig, case: dict[str, Any]) -> PublicEvalRecord:
-    shared = _shared_payload(base_config)
-    tool_name_map = _build_tool_name_map(cast(list[dict[str, Any]], case['functions']))
+def _tokenize_public_eval_text(value: str) -> set[str]:
+    tokens: set[str] = set()
+    for raw in re.findall(r'[A-Za-z0-9]+', value.lower()):
+        if raw in _GENERIC_TOKENS:
+            continue
+        tokens.add(raw)
+        if raw.endswith('s') and len(raw) > 4:
+            singular = raw[:-1]
+            if singular not in _GENERIC_TOKENS:
+                tokens.add(singular)
+    return tokens
+
+
+def _function_relevance_score(function: dict[str, Any], prompt_tokens: set[str]) -> int:
+    name_tokens = _tokenize_public_eval_text(str(function.get('name', '')))
+    description_tokens = _tokenize_public_eval_text(str(function.get('description', '')))
+    property_tokens: set[str] = set()
+    parameters = cast(dict[str, Any], function.get('parameters', {}))
+    properties = cast(dict[str, Any], parameters.get('properties', {}))
+    for property_name, property_schema in properties.items():
+        property_tokens |= _tokenize_public_eval_text(str(property_name))
+        if isinstance(property_schema, dict):
+            property_tokens |= _tokenize_public_eval_text(str(property_schema.get('description', '')))
+    return (
+        4 * len(prompt_tokens & name_tokens)
+        + 2 * len(prompt_tokens & property_tokens)
+        + len(prompt_tokens & description_tokens)
+    )
+
+
+def _looks_multi_intent(prompt: str) -> bool:
+    return _MULTI_INTENT_PATTERN.search(prompt) is not None
+
+
+def _select_bfcl_candidate_functions(prompt: str, functions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    prompt_tokens = _tokenize_public_eval_text(prompt)
+    scored = [
+        (
+            function,
+            _function_relevance_score(function, prompt_tokens),
+            len(prompt_tokens & _tokenize_public_eval_text(str(function.get('name', '')))),
+        )
+        for function in functions
+    ]
+    if not scored:
+        return []
+    best_score = max(score for _, score, _ in scored)
+    if best_score < 3:
+        return []
+    best_name_overlap = max(name_overlap for _, score, name_overlap in scored if score == best_score)
+    if best_name_overlap == 0 and best_score < 6:
+        return []
+    if _looks_multi_intent(prompt):
+        threshold = max(3, best_score - 1)
+        return [function for function, score, _ in scored if score >= threshold]
+    return [function for function, score, _ in scored if score == best_score]
+
+
+def _is_openai_compatible_provider(provider: str) -> bool:
+    lowered = provider.lower()
+    return any(token in lowered for token in ('openai', 'deepseek', 'compatible'))
+
+
+def _exception_chain(exc: BaseException) -> list[BaseException]:
+    chain: list[BaseException] = []
+    current: BaseException | None = exc
+    while current is not None and current not in chain:
+        chain.append(current)
+        next_exc = current.__cause__ or current.__context__
+        current = next_exc if isinstance(next_exc, BaseException) else None
+    return chain
+
+
+def _is_retryable_provider_400(base_config: AppConfig, exc: BaseException) -> bool:
+    if not _is_openai_compatible_provider(base_config.model.provider):
+        return False
+    for item in _exception_chain(exc):
+        if isinstance(item, httpx.HTTPStatusError) and item.response.status_code == 400:
+            return True
+        if '400 Bad Request' in str(item):
+            return True
+    return False
+
+
+def _same_function_selection(left: list[dict[str, Any]], right: list[dict[str, Any]]) -> bool:
+    return [str(item['name']) for item in left] == [str(item['name']) for item in right]
+
+
+def _make_bfcl_failure_record(
+    case: dict[str, Any],
+    exc: BaseException,
+    *,
+    duration_seconds: float,
+    fallback_stage: str,
+    fallback_attempts: list[str],
+) -> PublicEvalRecord:
+    return PublicEvalRecord(
+        suite=f"bfcl_{case['suite']}",
+        case_id=case['id'],
+        success=False,
+        duration_seconds=round(duration_seconds, 4),
+        tool_name_match=0.0,
+        argument_match=0.0,
+        expected_call_count=len(case['ground_truth']),
+        actual_call_count=0,
+        result_summary='',
+        error=str(exc),
+        fallback_stage=fallback_stage,
+        fallback_attempts=list(fallback_attempts),
+    )
+
+
+async def _run_bfcl_case_attempt(
+    base_config: AppConfig,
+    case: dict[str, Any],
+    *,
+    shared: dict[str, Any],
+    tool_name_map: dict[str, str],
+    functions: list[dict[str, Any]],
+    fallback_stage: str,
+    fallback_attempts: list[str],
+    strict_schema: bool,
+) -> _BfclAttemptResult:
     config = AppConfig.model_validate(
         {
             **shared,
             'graph': {
-                'name': f"bfcl-{case['id']}",
+                'name': f"bfcl-{case['id']}-{fallback_stage}",
                 'entrypoint': 'coordinator',
                 'agents': [
                     {
                         'name': 'coordinator',
                         'description': 'Public-eval tool-calling evaluator.',
                         'system_prompt': _bfcl_system_prompt(case),
-                        'tools': [tool_name_map[str(item['name'])] for item in case['functions']],
+                        'tools': [tool_name_map[str(item['name'])] for item in functions],
                         'sub_agents': [],
                         'max_iterations': 6,
                     }
@@ -293,10 +445,14 @@ async def _run_bfcl_case(base_config: AppConfig, case: dict[str, Any]) -> Public
     with tempfile.TemporaryDirectory(prefix=f"easy-agent-bfcl-{case['id']}-") as storage_dir:
         config.storage.path = storage_dir
         runtime = build_runtime_from_config(config)
-        for function in case['functions']:
+        for function in functions:
             original_name = str(function['name'])
             tool_name = tool_name_map[original_name]
-            input_schema = _normalize_schema(cast(dict[str, Any], function['parameters']))
+            input_schema = (
+                _strict_normalize_schema(cast(dict[str, Any], function['parameters']))
+                if strict_schema
+                else _normalize_schema(cast(dict[str, Any], function['parameters']))
+            )
 
             def record_tool_call(arguments: dict[str, Any], context: Any, *, bound_name: str = tool_name) -> dict[str, Any]:
                 return {
@@ -322,34 +478,90 @@ async def _run_bfcl_case(base_config: AppConfig, case: dict[str, Any]) -> Public
             trace = runtime.store.load_trace(result['run_id'])
             actual_calls = _extract_successful_tool_calls(trace)
             success, tool_name_match, argument_match = _score_bfcl_case(case, actual_calls, tool_name_map)
-            return PublicEvalRecord(
-                suite=f"bfcl_{case['suite']}",
-                case_id=case['id'],
-                success=success,
+            return _BfclAttemptResult(
+                record=PublicEvalRecord(
+                    suite=f"bfcl_{case['suite']}",
+                    case_id=case['id'],
+                    success=success,
+                    duration_seconds=round(duration, 4),
+                    tool_name_match=tool_name_match,
+                    argument_match=argument_match,
+                    expected_call_count=len(case['ground_truth']),
+                    actual_call_count=len(actual_calls),
+                    result_summary=_summarize_result(result.get('result')),
+                    error=None if success else json.dumps({'actual_calls': actual_calls}, ensure_ascii=False),
+                    fallback_stage=fallback_stage,
+                    fallback_attempts=list(fallback_attempts),
+                ),
                 duration_seconds=round(duration, 4),
-                tool_name_match=tool_name_match,
-                argument_match=argument_match,
-                expected_call_count=len(case['ground_truth']),
-                actual_call_count=len(actual_calls),
-                result_summary=_summarize_result(result.get('result')),
-                error=None if success else json.dumps({'actual_calls': actual_calls}, ensure_ascii=False),
             )
         except Exception as exc:
             duration = time.perf_counter() - start
-            return PublicEvalRecord(
-                suite=f"bfcl_{case['suite']}",
-                case_id=case['id'],
-                success=False,
+            return _BfclAttemptResult(
+                error=exc,
                 duration_seconds=round(duration, 4),
-                tool_name_match=0.0,
-                argument_match=0.0,
-                expected_call_count=len(case['ground_truth']),
-                actual_call_count=0,
-                result_summary='',
-                error=str(exc),
+                retryable_provider_400=_is_retryable_provider_400(base_config, exc),
             )
         finally:
             await runtime.aclose()
+
+
+async def _run_bfcl_case(base_config: AppConfig, case: dict[str, Any]) -> PublicEvalRecord:
+    shared = _shared_payload(base_config)
+    tool_name_map = _build_tool_name_map(cast(list[dict[str, Any]], case['functions']))
+    prompt = str(case['messages'][0]['content'])
+    all_functions = list(cast(list[dict[str, Any]], case['functions']))
+    attempt_history: list[str] = []
+    stages: list[tuple[str, list[dict[str, Any]], bool]] = [
+        ('base', all_functions, False),
+        ('strict_schema_retry', all_functions, True),
+    ]
+    last_error: Exception | None = None
+    last_duration = 0.0
+    last_stage = 'base'
+    while stages:
+        fallback_stage, functions, strict_schema = stages.pop(0)
+        attempt_history.append(fallback_stage)
+        last_stage = fallback_stage
+        attempt = await _run_bfcl_case_attempt(
+            base_config,
+            case,
+            shared=shared,
+            tool_name_map=tool_name_map,
+            functions=functions,
+            fallback_stage=fallback_stage,
+            fallback_attempts=attempt_history,
+            strict_schema=strict_schema,
+        )
+        if attempt.record is not None:
+            return attempt.record
+        if attempt.error is None:
+            break
+        last_error = attempt.error
+        last_duration = attempt.duration_seconds
+        if not attempt.retryable_provider_400:
+            return _make_bfcl_failure_record(
+                case,
+                attempt.error,
+                duration_seconds=attempt.duration_seconds,
+                fallback_stage=fallback_stage,
+                fallback_attempts=attempt_history,
+            )
+        if fallback_stage != 'strict_schema_retry':
+            continue
+        candidate_functions = _select_bfcl_candidate_functions(prompt, all_functions)
+        if _same_function_selection(candidate_functions, functions):
+            continue
+        stages.append(('candidate_pruned_retry', candidate_functions, True))
+    if last_error is None:
+        last_error = RuntimeError('BFCL case failed without a captured error')
+    return _make_bfcl_failure_record(
+        case,
+        last_error,
+        duration_seconds=last_duration,
+        fallback_stage=last_stage,
+        fallback_attempts=attempt_history,
+    )
 
 
 async def _run_tau_case(base_config: AppConfig, case: dict[str, Any]) -> PublicEvalRecord:
@@ -549,4 +761,5 @@ def run_public_eval_suite(config_path: str | Path) -> dict[str, Any]:
             'tau2': 'https://github.com/sierra-research/tau2-bench',
         },
     }
+
 

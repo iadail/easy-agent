@@ -9,6 +9,7 @@ import httpx
 from tenacity import AsyncRetrying, stop_after_attempt, wait_fixed
 
 from agent_common.models import AssistantResponse, ChatMessage, Protocol, ToolCall, ToolSpec
+from agent_common.schema_utils import normalize_json_schema
 from agent_config.app import ModelConfig
 
 
@@ -39,88 +40,8 @@ def _anthropic_tool(tool: ToolSpec) -> dict[str, Any]:
     }
 
 
-def _normalize_openai_type(value: Any) -> str:
-    if isinstance(value, list):
-        candidates = [_normalize_openai_type(item) for item in value]
-        non_null = [item for item in candidates if item != 'null']
-        if len(non_null) == 1:
-            return non_null[0]
-        if set(non_null).issubset({'integer', 'number'}):
-            return 'number'
-        if non_null:
-            return non_null[0]
-        return 'string'
-    schema_type = str(value or 'object')
-    if schema_type == 'dict':
-        return 'object'
-    if schema_type == 'tuple':
-        return 'array'
-    return schema_type
-
-
-def _collapse_openai_union(options: Any) -> dict[str, Any]:
-    if not isinstance(options, list):
-        return {'type': 'string'}
-    normalized_options = [_openai_safe_schema(item) for item in options if isinstance(item, dict)]
-    non_null = [item for item in normalized_options if item.get('type') != 'null']
-    if len(non_null) == 1:
-        return non_null[0]
-    candidate_types = {str(item.get('type', 'string')) for item in non_null}
-    if candidate_types.issubset({'integer', 'number'}):
-        return {'type': 'number'}
-    if candidate_types == {'boolean'}:
-        return {'type': 'boolean'}
-    if candidate_types == {'array'}:
-        return non_null[0] if non_null else {'type': 'array', 'items': {'type': 'string'}}
-    if candidate_types == {'object'}:
-        return non_null[0] if non_null else {'type': 'object', 'properties': {}}
-    if 'string' in candidate_types:
-        return {'type': 'string'}
-    if non_null:
-        return {'type': str(non_null[0].get('type', 'string'))}
-    return {'type': 'string'}
-
-
 def _openai_safe_schema(schema: dict[str, Any]) -> dict[str, Any]:
-    normalized = dict(schema)
-    for key in ('anyOf', 'oneOf', 'allOf'):
-        if key in normalized:
-            collapsed = _collapse_openai_union(normalized.get(key))
-            preserved = {name: value for name, value in normalized.items() if name not in {'anyOf', 'oneOf', 'allOf'}}
-            normalized = {**preserved, **collapsed}
-            break
-    if 'type' in normalized:
-        schema_type = _normalize_openai_type(normalized.get('type'))
-    elif 'properties' in normalized:
-        schema_type = 'object'
-    elif 'items' in normalized:
-        schema_type = 'array'
-    else:
-        schema_type = 'object'
-    normalized['type'] = schema_type
-    if schema_type == 'object':
-        raw_properties = normalized.get('properties')
-        properties = raw_properties if isinstance(raw_properties, dict) else {}
-        safe_properties: dict[str, Any] = {}
-        for key, value in properties.items():
-            safe_properties[key] = _openai_safe_schema(value) if isinstance(value, dict) else {'type': 'string'}
-        normalized['properties'] = safe_properties
-        required = normalized.get('required')
-        if isinstance(required, list):
-            normalized['required'] = [item for item in required if item in safe_properties]
-        else:
-            normalized.pop('required', None)
-        if 'additionalProperties' in normalized and not isinstance(normalized['additionalProperties'], bool):
-            normalized.pop('additionalProperties', None)
-    elif schema_type == 'array':
-        raw_items = normalized.get('items')
-        if isinstance(raw_items, dict):
-            normalized['items'] = _openai_safe_schema(raw_items)
-        else:
-            normalized['items'] = {'type': _normalize_openai_type(raw_items) if raw_items else 'string'}
-    for key in ['default', 'examples', 'title', '$schema', '$defs', 'definitions', 'format', 'nullable']:
-        normalized.pop(key, None)
-    return normalized
+    return normalize_json_schema(schema)
 
 
 class OpenAIAdapter:
@@ -438,4 +359,7 @@ class HttpModelClient:
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+
+
 

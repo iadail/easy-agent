@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import contextvars
 import os
+import re
 import sys
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -25,11 +28,13 @@ from mcp.os.win32.utilities import (
 from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
 from mcp.shared.message import SessionMessage
 
-from agent_common.models import ChatMessage, McpAuthType, RunContext, ToolSpec
+from agent_common.models import ChatMessage, HumanLoopMode, McpAuthType, RunContext, ToolSpec
+from agent_common.schema_utils import normalize_json_schema
 from agent_config.app import McpRootConfig, McpServerConfig
 from agent_integrations.human_loop import HumanLoopManager
 from agent_integrations.sandbox import SandboxManager, SandboxRequest, SandboxTarget
 from agent_integrations.storage import SQLiteRunStore
+from agent_integrations.tool_validation import normalize_and_validate_tool_arguments
 from agent_integrations.workbench import WorkbenchManager
 
 RedirectHandler = Callable[[str], Awaitable[None]]
@@ -92,6 +97,10 @@ class BaseMcpClient:
         self._redirect_handler = redirect_handler
         self._callback_handler = callback_handler
         self.capabilities: dict[str, Any] = {}
+        self._run_context: contextvars.ContextVar[RunContext | None] = contextvars.ContextVar(
+            f'mcp_run_context_{config.name}',
+            default=None,
+        )
 
     async def start(self) -> None:
         raise NotImplementedError
@@ -125,6 +134,18 @@ class BaseMcpClient:
 
     async def aclose(self) -> None:
         raise NotImplementedError
+
+    def bind_run_context(self, context: RunContext | None) -> contextvars.Token[RunContext | None]:
+        return self._run_context.set(context)
+
+    def reset_run_context(self, token: contextvars.Token[RunContext | None]) -> None:
+        self._run_context.reset(token)
+
+    def _approval_run_context(self) -> RunContext:
+        context = self._run_context.get()
+        if context is not None:
+            return context
+        return RunContext(run_id=f'mcp-{self.config.name}', workdir=Path.cwd(), node_id=None)
 
     def _build_headers(self) -> dict[str, str]:
         headers = dict(self.config.headers)
@@ -173,23 +194,71 @@ class BaseMcpClient:
             f'Use `easy-agent mcp auth login {self.config.name}`.'
         )
 
+    def _approval_context_for_risk(self, risk_level: str) -> RunContext:
+        context = self._approval_run_context()
+        if risk_level == 'high' and context.approval_mode is not HumanLoopMode.DEFERRED:
+            return replace(context, approval_mode=HumanLoopMode.DEFERRED)
+        return context
+
+    def _sampling_approval_payload(
+        self,
+        params: mcp_types.CreateMessageRequestParams,
+        risk_level: str,
+        risk_reasons: list[str],
+    ) -> dict[str, Any]:
+        preview_parts = [_sampling_message_to_text(item)[:200] for item in params.messages]
+        tool_names = [str(item.name) for item in params.tools or []]
+        return {
+            'server': self.config.name,
+            'risk_level': risk_level,
+            'risk_reasons': risk_reasons,
+            'include_context': params.includeContext,
+            'tool_count': len(tool_names),
+            'tool_names': tool_names,
+            'text_preview': '\n'.join(part for part in preview_parts if part)[:500],
+            'sampling': params.model_dump(mode='json', exclude_none=True),
+        }
+
+    def _elicitation_approval_payload(
+        self,
+        params: mcp_types.ElicitRequestParams,
+        risk_level: str,
+        risk_reasons: list[str],
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            'server': self.config.name,
+            'risk_level': risk_level,
+            'risk_reasons': risk_reasons,
+            'mode': params.mode,
+            'message': params.message,
+            'elicitation': params.model_dump(mode='json', exclude_none=True),
+        }
+        if params.mode == 'form':
+            payload['requested_schema'] = _normalize_requested_schema(params.requestedSchema)
+        else:
+            payload['url'] = params.url
+            payload['elicitation_id'] = params.elicitationId
+            payload['url_host'] = _url_host(params.url)
+        return payload
+
     async def _sampling_callback(
         self,
         context: Any,
         params: mcp_types.CreateMessageRequestParams,
     ) -> mcp_types.CreateMessageResult | mcp_types.ErrorData:
         del context
+        risk_level, risk_reasons = _classify_sampling_request(params)
         if self._human_loop is not None and self._human_loop.config.approve_mcp_sampling:
-            approval_context = RunContext(run_id='mcp-sampling', workdir=Path.cwd(), node_id=None)
+            approval_context = self._approval_context_for_risk(risk_level)
             await self._human_loop.require_approval(
                 approval_context,
                 request_key=(
                     f'mcp_sampling:{self.config.name}:'
-                    f'{self._human_loop.stable_key(params.model_dump(mode="json", exclude_none=True))}'
+                    f'{self._human_loop.stable_key(params.model_dump(mode="json", exclude_none=True), risk_level)}'
                 ),
                 kind='mcp_sampling',
                 title=f'Approve MCP sampling request for {self.config.name}',
-                payload={'server': self.config.name, 'sampling': params.model_dump(mode='json', exclude_none=True)},
+                payload=self._sampling_approval_payload(params, risk_level, risk_reasons),
             )
         messages: list[ChatMessage] = []
         if params.systemPrompt:
@@ -218,21 +287,22 @@ class BaseMcpClient:
         del context
         if self._human_loop is None:
             return mcp_types.ErrorData(code=mcp_types.INVALID_REQUEST, message='Elicitation requires a human loop')
-        approval_context = RunContext(run_id='mcp-elicitation', workdir=Path.cwd(), node_id=None)
+        risk_level, risk_reasons = _classify_elicitation_request(params)
+        approval_context = self._approval_context_for_risk(risk_level)
         response_payload = await self._human_loop.require_approval(
             approval_context,
             request_key=(
                 f'mcp_elicitation:{self.config.name}:'
-                f'{self._human_loop.stable_key(params.model_dump(mode="json", exclude_none=True))}'
+                f'{self._human_loop.stable_key(params.model_dump(mode="json", exclude_none=True), risk_level)}'
             ),
             kind='mcp_elicitation',
             title=f'Approve MCP elicitation request for {self.config.name}',
-            payload={'server': self.config.name, 'elicitation': params.model_dump(mode='json', exclude_none=True)},
+            payload=self._elicitation_approval_payload(params, risk_level, risk_reasons),
         )
-        action = str(response_payload.get('action') or 'accept')
-        if action not in {'accept', 'decline', 'cancel'}:
-            action = 'accept'
-        return mcp_types.ElicitResult(action=cast(Any, action), content=cast(dict[str, Any], response_payload.get('content', {})))
+        result = _coerce_elicitation_result(params, response_payload)
+        if isinstance(result, mcp_types.ErrorData):
+            return result
+        return result
 
     async def _roots_callback(
         self,
@@ -715,8 +785,10 @@ class McpClientManager:
                 node_id=context.node_id,
                 span_id=f'mcp:{server_name}:{tool_name}',
             )
+        client = self._clients[server_name]
+        token = client.bind_run_context(context)
         try:
-            result = await self._clients[server_name].call_tool(tool_name, arguments)
+            result = await client.call_tool(tool_name, arguments)
         except Exception as exc:
             if context is not None and self._store is not None:
                 self._store.record_event(
@@ -728,6 +800,8 @@ class McpClientManager:
                     span_id=f'mcp:{server_name}:{tool_name}',
                 )
             raise
+        finally:
+            client.reset_run_context(token)
         if context is not None and self._store is not None:
             self._store.record_event(
                 context.run_id,
@@ -745,7 +819,97 @@ class McpClientManager:
         self._started = False
         self._tool_cache = {}
 
+def _normalize_requested_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    normalized = normalize_json_schema(schema)
+    if normalized.get('type') != 'object':
+        normalized = {'type': 'object', 'properties': {}, 'required': []}
+    properties = cast(dict[str, Any], normalized.get('properties', {}))
+    normalized['properties'] = {key: value for key, value in properties.items() if isinstance(value, dict)}
+    required = normalized.get('required', [])
+    normalized['required'] = [str(item) for item in required if str(item) in normalized['properties']]
+    return normalized
 
+
+def _sampling_content_types(message: mcp_types.SamplingMessage) -> list[str]:
+    content = message.content
+    if isinstance(content, list):
+        return [str(getattr(item, 'type', 'unknown')) for item in content]
+    return [str(getattr(content, 'type', 'unknown'))]
+
+
+def _classify_sampling_request(params: mcp_types.CreateMessageRequestParams) -> tuple[str, list[str]]:
+    reasons: list[str] = []
+    if params.tools:
+        reasons.append('sampling request exposes tools')
+    if params.includeContext == 'allServers':
+        reasons.append('sampling request asks for allServers context')
+    for item in params.messages:
+        for content_type in _sampling_content_types(item):
+            if content_type in {'tool_use', 'tool_result', 'resource', 'resource_link'}:
+                reasons.append(f'sampling content includes {content_type}')
+            elif content_type != 'text':
+                reasons.append(f'sampling content includes non-text block: {content_type}')
+    unique_reasons = list(dict.fromkeys(reasons))
+    return ('high', unique_reasons) if unique_reasons else ('low', [])
+
+
+def _sensitive_elicitation_text(text: str) -> bool:
+    return re.search(r'(token|secret|password|credential|api[_-]?key|oauth|payment|card|bank|otp|code)', text, re.IGNORECASE) is not None
+
+
+def _classify_elicitation_request(params: mcp_types.ElicitRequestParams) -> tuple[str, list[str]]:
+    reasons: list[str] = []
+    if params.mode == 'url':
+        reasons.append('url-mode elicitation requires out-of-band navigation')
+        return 'high', reasons
+    normalized_schema = _normalize_requested_schema(params.requestedSchema)
+    for field_name, field_schema in cast(dict[str, dict[str, Any]], normalized_schema.get('properties', {})).items():
+        description = str(field_schema.get('description', ''))
+        if _sensitive_elicitation_text(field_name) or _sensitive_elicitation_text(description):
+            reasons.append(f'form field looks sensitive: {field_name}')
+    unique_reasons = list(dict.fromkeys(reasons))
+    return ('high', unique_reasons) if unique_reasons else ('low', [])
+
+
+def _coerce_form_elicitation_content(
+    requested_schema: dict[str, Any],
+    raw_content: Any,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    if raw_content is None:
+        raw_payload: dict[str, Any] = {}
+    elif isinstance(raw_content, dict):
+        raw_payload = dict(raw_content)
+    else:
+        return None, ['form elicitation content must be a JSON object']
+    normalized_schema = _normalize_requested_schema(requested_schema)
+    properties = cast(dict[str, Any], normalized_schema.get('properties', {}))
+    filtered_payload = {key: value for key, value in raw_payload.items() if key in properties}
+    validation = normalize_and_validate_tool_arguments(normalized_schema, filtered_payload)
+    if validation.errors:
+        return None, validation.errors
+    return validation.normalized, []
+
+
+def _coerce_elicitation_result(
+    params: mcp_types.ElicitRequestParams,
+    response_payload: dict[str, Any],
+) -> mcp_types.ElicitResult | mcp_types.ErrorData:
+    action = str(response_payload.get('action') or 'accept').lower()
+    if action not in {'accept', 'decline', 'cancel'}:
+        action = 'accept'
+    if action != 'accept':
+        return mcp_types.ElicitResult(action=cast(Any, action), content=None)
+    if params.mode == 'url':
+        return mcp_types.ElicitResult(action='accept', content=None)
+    content, errors = _coerce_form_elicitation_content(params.requestedSchema, response_payload.get('content'))
+    if errors:
+        return mcp_types.ErrorData(code=mcp_types.INVALID_REQUEST, message='; '.join(errors))
+    return mcp_types.ElicitResult(action='accept', content=cast(dict[str, Any], content))
+
+
+def _url_host(url: str) -> str:
+    match = re.match(r'^[a-z]+://([^/]+)', url, re.IGNORECASE)
+    return match.group(1) if match else url
 
 def _sampling_message_to_text(message: mcp_types.SamplingMessage) -> str:
     content = message.content
@@ -772,3 +936,16 @@ def _content_block_to_text(content: Any) -> str | None:
 
 def _root_to_uri(path: str) -> str:
     return Path(path).resolve().as_uri()
+
+
+
+
+
+
+
+
+
+
+
+
+

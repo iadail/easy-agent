@@ -85,8 +85,8 @@ Many agent repositories jump straight from "call a model" to "ship a product". T
 - Historical checkpoint listing, time-travel replay, and branchable `--fork` resume for graph and team workflows.
 - A2A-style remote agent federation with exported local targets, remote inspection, task send or stream flows, durable task state, and CLI federation tooling.
 - Executor and workbench isolation for long-lived command skills, MCP subprocesses, execution manifests, TTL cleanup, and fork-safe resume snapshots.
-- MCP roots, sampling, elicitation, `streamable_http`, and authorization-aware remote transports with persisted OAuth state.
-- Public evaluation helpers for BFCL subset cases and tau2 mock cases.
+- MCP roots, risk-aware sampling and elicitation approvals, richer form or URL elicitation handling, `streamable_http`, and authorization-aware remote transports with persisted OAuth state.
+- Public evaluation helpers for BFCL subset cases and tau2 mock cases, with provider-aware fallback telemetry for OpenAI-compatible schema failures.
 
 ## Human Loop, Replay, and MCP
 
@@ -94,8 +94,8 @@ The current runtime already ships the reliability controls that were previously 
 
 - Sensitive tools can pause for human approval before execution, and swarm handoffs plus harness resumes can pause on the same human loop.
 - Runs expose safe-point interrupts, approval queues, checkpoint listing, historical replay, and branchable `resume --fork` flows.
-- MCP integrations now support explicit roots, backward-compatible filesystem root inference for stdio servers, sampling callbacks, elicitation callbacks, `streamable_http`, and auth-aware remote transports with persisted OAuth state.
-- The CLI exposes `approvals`, `checkpoints`, `replay`, `interrupt`, `mcp roots`, and `mcp auth` commands so these controls are usable without custom code.
+- MCP integrations now support explicit roots, backward-compatible filesystem root inference for stdio servers, risk-aware sampling callbacks, richer form or URL elicitation callbacks, `streamable_http`, and auth-aware remote transports with persisted OAuth state.
+- High-risk MCP sampling and URL elicitation requests are forced into deferred approval instead of silently bypassing the human loop, and the CLI exposes `approvals`, `checkpoints`, `replay`, `interrupt`, `mcp roots`, and `mcp auth` commands so these controls stay usable without custom code.
 
 ## A2A Remote Agent Federation
 
@@ -348,23 +348,22 @@ Python CLI smoke is also verified through `CliRunner` against `agent_cli.app:app
 
 ## Real Network Test Set Results
 
-Snapshot date: March 29, 2026.
+Snapshot date: March 30, 2026.
 
-This snapshot combines fresh Python verification from March 29, 2026 with the latest retained benchmark and public-eval artifacts already present under `.easy-agent/`. The fresh verification used Python `3.12.11`, local `.env.local` credentials, live DeepSeek calls, the repository's real MCP-backed integration suite, and a local Podman machine for executor coverage.
+This snapshot combines fresh Python verification and a fresh live public-eval refresh from March 30, 2026 with the retained real-network matrix from March 29, 2026 and the retained benchmark artifact from March 27, 2026. The March 30 verification used Python `3.12.11`, local `.env.local` credentials, live DeepSeek calls, and the repository's real MCP-backed integration suite.
 
 ### Python Verification Snapshot
 
 | Suite | Command | Result |
 | --- | --- | --- |
-| Static checks | `.\.venv\Scripts\ruff.exe check src tests scripts` | passed |
-| Typing | `.\.venv\Scripts\mypy.exe src tests scripts` | passed |
-| Unit tests | `.\.venv\Scripts\python.exe -m pytest tests/unit -q --basetemp=%TEMP%\easy-agent-pytest\unit-full-<timestamp>` | `76 passed` |
-| Dedicated real-network pytest | `.\.venv\Scripts\python.exe -m pytest tests/integration/test_real_network_eval.py -q -m real --basetemp=%TEMP%\easy-agent-pytest\integration-real-network-<timestamp>` | `1 passed` |
-| Real integration tests | `.\.venv\Scripts\python.exe -m pytest tests/integration -m real -q --basetemp=%TEMP%\easy-agent-pytest\integration-full-<timestamp>` | `4 passed`, `1 skipped` |
-| Live benchmark artifact | `.easy-agent/benchmark-report.json` | existing snapshot reused |
-| Live public-eval artifact | `.easy-agent/public-eval-report.json` | existing snapshot reused |
-| Live real-network refresh | Python helper calling `run_real_network_suite()` | report refreshed with `6 passed` |
-| Python CLI smoke | `CliRunner` against `agent_cli.app:app` for `--help`, `doctor`, `teams list`, `harness list`, `federation list` | passed |
+| Static checks | `.\.venv\Scripts\python.exe -m ruff check src tests scripts` | passed |
+| Typing | `.\.venv\Scripts\python.exe -m mypy src tests scripts` | passed |
+| Unit tests | `.\.venv\Scripts\python.exe -m pytest tests/unit -q --basetemp=%TEMP%\easy-agent-pytest\unit-full-<timestamp>` | `83 passed` |
+| Real integration tests | `.\.venv\Scripts\python.exe -m pytest tests/integration -m real -q --basetemp=%TEMP%\easy-agent-pytest\integration-full-<timestamp>` | `5 passed` |
+| Live benchmark artifact | `.easy-agent/benchmark-report.json` | existing March 27, 2026 snapshot reused |
+| Live public-eval refresh | Python helper calling `run_public_eval_suite('easy-agent.yml')` | report refreshed with `overall.bfcl_pass_rate = 0.8750` |
+| Live real-network artifact | `.easy-agent/real-network-report.json` | existing March 29, 2026 snapshot reused |
+| Python CLI coverage | `CliRunner`-based CLI tests inside the full unit suite | covered by the current `83 passed` run |
 
 ### Real Network Matrix
 
@@ -398,29 +397,30 @@ Source: latest checked `.easy-agent/benchmark-report.json` artifact retained fro
 | Suite | Pass Rate | Notes |
 | --- | --- | --- |
 | `bfcl_simple` | `0.8750` | 7 of 8 cases passed |
-| `bfcl_multiple` | `0.2500` | 2 of 8 cases passed |
-| `bfcl_parallel_multiple` | `0.5000` | 2 of 4 cases passed |
-| `bfcl_irrelevance` | `0.0000` | 0 of 4 cases passed |
-| `tau2_mock` | `0.3333` | 1 of 3 cases passed |
-| `overall.bfcl_pass_rate` | `0.4583` | unchanged overall, but long-run MCP workflows no longer fail on the schema-driven `400` path |
+| `bfcl_multiple` | `0.8750` | 7 of 8 cases passed |
+| `bfcl_parallel_multiple` | `0.7500` | 3 of 4 cases passed |
+| `bfcl_irrelevance` | `1.0000` | 4 of 4 cases passed |
+| `tau2_mock` | `0.6667` | 2 of 3 cases passed |
+| `overall.bfcl_pass_rate` | `0.8750` | provider-aware fallback recovered the prior OpenAI-compatible schema failures; remaining misses are behavior-level over-calls rather than provider `400`s |
 
-Source: latest checked `.easy-agent/public-eval-report.json` artifact retained from the March 27, 2026 live verification pass.
+Source: `.easy-agent/public-eval-report.json` refreshed on March 30, 2026.
 
 Current caveats:
 
-- The full `tests/integration -m real` pass still includes one host-side skip on this machine because local Redis is not listening on `127.0.0.1:6379`, so the long-run real suite does not execute its Redis-backed path in this round.
-- The live suite still emits Windows `asyncio` subprocess cleanup warnings after completion, but the real tests and generated reports completed successfully.
-- DeepSeek's OpenAI-compatible endpoint still returns provider-side `400 Bad Request` responses on a subset of BFCL multiple and irrelevance cases even after stronger schema flattening and tighter tool-call prompting.
+- The live suite still emits Windows `asyncio` subprocess cleanup warnings after completion, but the integration tests and report refresh completed successfully.
+- The remaining BFCL misses are now behavior-level duplicate or over-eager tool calls (`simple_5`, `multiple_7`, and `parallel_multiple_3`) rather than provider-side schema rejection.
+- The remaining tau2 miss is the history-heavy `update_task_with_message_history` case; the model still asks a follow-up instead of grounding to the prior tool result.
+- The public-eval report now records `fallback_stage` and `fallback_attempts` so provider-compatible degradation paths stay inspectable during future regression triage.
 
 ## Next Reinforcement
 
 These next steps are based on the current public A2A and MCP protocol surfaces, not just internal backlog notes.
 
-- Push federation card negotiation closer to the latest public A2A surface by adding richer artifact or part-level modality declarations, `ListTasks` cursor pagination (`pageToken` / `nextPageToken`), and clearer notification compatibility metadata.
-- Harden federation security toward production-grade remote trust with stronger auth scheme hints, signed callback verification, OAuth or OIDC flows, and optional mTLS between agent servers.
+- Push federation card and task negotiation closer to the latest public A2A surface by adding richer artifact or part-level modality declarations, `ListTasks` cursor pagination (`pageToken` / `nextPageToken`), and clearer notification compatibility metadata.
+- Harden federation security toward production-grade remote trust with stronger auth scheme hints, signed callback verification, OAuth or OIDC flows, callback audience validation, and optional mTLS between agent servers.
 - Expand MCP capability negotiation from basic roots support to full `roots/list_changed` flows plus stronger `streamable_http` reconnect, auth-refresh, and server-initiated lifecycle handling.
-- Make MCP sampling and elicitation policies more granular by separating low-risk and high-risk remote requests, and by supporting richer form or URL elicitation result handling without bypassing human approval.
-- Add provider-aware public-eval fallback strategies so complex BFCL schemas degrade more gracefully instead of failing fast on OpenAI-compatible `400` responses.
+- Extend MCP sampling beyond the current text-first bridge so safe low-risk requests can preserve richer content blocks when the provider and runtime support them, while high-risk requests remain deferred behind human approval.
+- Add stage-aware public-eval analytics, per-provider schema compatibility matrices, and stronger regression fixtures for duplicate-call suppression plus history-grounding cases.
 - Extend the real-network suite with mixed live-model federation runs, duplicate-delivery or replay resilience checks, and faster delta-based container or microVM snapshot reuse on repeat executions.
 
 ## Design References

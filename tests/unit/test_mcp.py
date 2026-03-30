@@ -5,12 +5,14 @@ import sys
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
+import mcp.types as mcp_types
 import pytest
 
+from agent_common.models import HumanLoopMode, RunContext
 from agent_config.app import McpServerConfig
-from agent_integrations.mcp import McpClientManager, build_mcp_tool_name
+from agent_integrations.mcp import BaseMcpClient, McpClientManager, build_mcp_tool_name
 from agent_integrations.sandbox import SandboxManager, SandboxMode, SandboxTarget
 
 STDIO_SERVER = r"""
@@ -76,6 +78,44 @@ class McpHttpHandler(BaseHTTPRequestHandler):
         return
 
 
+class _RecordingHumanLoop:
+    def __init__(self, *, response_payload: dict[str, Any] | None = None) -> None:
+        self.config = type(
+            'Cfg',
+            (),
+            {'approve_mcp_sampling': True, 'approve_mcp_elicitation': True},
+        )()
+        self.response_payload = response_payload or {}
+        self.calls: list[tuple[RunContext, dict[str, Any]]] = []
+
+    async def require_approval(self, context: RunContext, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append((context, kwargs))
+        return dict(self.response_payload)
+
+    def stable_key(self, *parts: Any) -> str:
+        return 'stable-key'
+
+
+class _ModelClient:
+    async def complete(self, messages: list[Any], tools: list[Any]) -> Any:
+        del messages, tools
+        return type('Response', (), {'text': 'approved', 'tool_calls': [], 'model_name': 'stub'})()
+
+
+class _DummyMcpClient(BaseMcpClient):
+    async def start(self) -> None:
+        return None
+
+    async def list_tools(self) -> list[Any]:
+        return []
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
+        return {'name': name, 'arguments': arguments}
+
+    async def aclose(self) -> None:
+        return None
+
+
 @pytest.mark.asyncio
 async def test_mcp_manager_supports_stdio_and_http_sse() -> None:
     server = HTTPServer(('127.0.0.1', 0), McpHttpHandler)
@@ -116,10 +156,10 @@ async def test_mcp_manager_supports_stdio_and_http_sse() -> None:
     assert remote_result['prompt'] == 'hi'
 
 
+
 def test_build_mcp_tool_name_sanitizes_separator() -> None:
     assert build_mcp_tool_name('filesystem', 'read_text_file') == 'mcp__filesystem__read_text_file'
     assert build_mcp_tool_name('pg-server', 'query/sql') == 'mcp__pg-server__query_sql'
-
 
 
 @pytest.mark.asyncio
@@ -146,6 +186,7 @@ async def test_mcp_manager_infers_filesystem_roots_from_stdio_command(tmp_path: 
     assert roots[0]['uri'].startswith('file:///')
 
 
+
 def test_stdio_filesystem_client_disables_server_roots_capability(tmp_path: Path) -> None:
     sandbox_manager = SandboxManager(
         mode=SandboxMode.PROCESS,
@@ -166,4 +207,138 @@ def test_stdio_filesystem_client_disables_server_roots_capability(tmp_path: Path
     client = manager._clients['filesystem']
 
     assert client._supports_server_roots() is False
+
+
+@pytest.mark.asyncio
+async def test_sampling_callback_uses_bound_run_context_and_forces_deferred_for_high_risk() -> None:
+    human_loop = _RecordingHumanLoop()
+    client = _DummyMcpClient(
+        McpServerConfig(name='remote', transport='streamable_http', url='http://example.com'),
+        store=None,
+        model_client=_ModelClient(),
+        human_loop=cast(Any, human_loop),
+        redirect_handler=None,
+        callback_handler=None,
+    )
+    run_context = RunContext(run_id='run-123', workdir=Path.cwd(), node_id='node-1', approval_mode=HumanLoopMode.INLINE)
+    token = client.bind_run_context(run_context)
+    try:
+        result = await client._sampling_callback(
+            None,
+            mcp_types.CreateMessageRequestParams(
+                messages=[mcp_types.SamplingMessage(role='user', content=mcp_types.TextContent(type='text', text='hello'))],
+                maxTokens=32,
+                tools=[mcp_types.Tool(name='remote_lookup', inputSchema={'type': 'object'})],
+            ),
+        )
+    finally:
+        client.reset_run_context(token)
+
+    assert isinstance(result, mcp_types.CreateMessageResult)
+    approval_context, payload = human_loop.calls[0]
+    assert approval_context.run_id == 'run-123'
+    assert approval_context.approval_mode is HumanLoopMode.DEFERRED
+    assert payload['payload']['risk_level'] == 'high'
+    assert payload['payload']['tool_names'] == ['remote_lookup']
+
+
+@pytest.mark.asyncio
+async def test_sampling_callback_keeps_inline_for_low_risk_request() -> None:
+    human_loop = _RecordingHumanLoop()
+    client = _DummyMcpClient(
+        McpServerConfig(name='remote', transport='streamable_http', url='http://example.com'),
+        store=None,
+        model_client=_ModelClient(),
+        human_loop=cast(Any, human_loop),
+        redirect_handler=None,
+        callback_handler=None,
+    )
+    run_context = RunContext(run_id='run-456', workdir=Path.cwd(), node_id='node-2', approval_mode=HumanLoopMode.INLINE)
+    token = client.bind_run_context(run_context)
+    try:
+        await client._sampling_callback(
+            None,
+            mcp_types.CreateMessageRequestParams(
+                messages=[mcp_types.SamplingMessage(role='user', content=mcp_types.TextContent(type='text', text='hello'))],
+                maxTokens=16,
+            ),
+        )
+    finally:
+        client.reset_run_context(token)
+
+    approval_context, payload = human_loop.calls[0]
+    assert approval_context.run_id == 'run-456'
+    assert approval_context.approval_mode is HumanLoopMode.INLINE
+    assert payload['payload']['risk_level'] == 'low'
+
+
+@pytest.mark.asyncio
+async def test_elicitation_callback_validates_form_content_and_drops_unknown_keys() -> None:
+    human_loop = _RecordingHumanLoop(response_payload={'action': 'accept', 'content': {'name': 'Alice', 'count': '2', 'ignored': 'x'}})
+    client = _DummyMcpClient(
+        McpServerConfig(name='remote', transport='streamable_http', url='http://example.com'),
+        store=None,
+        model_client=_ModelClient(),
+        human_loop=cast(Any, human_loop),
+        redirect_handler=None,
+        callback_handler=None,
+    )
+    run_context = RunContext(run_id='run-form', workdir=Path.cwd(), node_id='node-3', approval_mode=HumanLoopMode.INLINE)
+    token = client.bind_run_context(run_context)
+    try:
+        result = await client._elicitation_callback(
+            None,
+            mcp_types.ElicitRequestFormParams(
+                message='Provide profile data',
+                requestedSchema={
+                    'type': 'object',
+                    'properties': {'name': {'type': 'string'}, 'count': {'type': 'integer'}},
+                    'required': ['name'],
+                },
+            ),
+        )
+    finally:
+        client.reset_run_context(token)
+
+    assert isinstance(result, mcp_types.ElicitResult)
+    assert result.action == 'accept'
+    assert result.content == {'name': 'Alice', 'count': 2}
+    approval_context, payload = human_loop.calls[0]
+    assert approval_context.run_id == 'run-form'
+    assert payload['payload']['mode'] == 'form'
+
+
+@pytest.mark.asyncio
+async def test_elicitation_callback_for_url_mode_forces_deferred_and_omits_content() -> None:
+    human_loop = _RecordingHumanLoop(response_payload={'action': 'accept', 'content': {'ignored': 'x'}})
+    client = _DummyMcpClient(
+        McpServerConfig(name='remote', transport='streamable_http', url='http://example.com'),
+        store=None,
+        model_client=_ModelClient(),
+        human_loop=cast(Any, human_loop),
+        redirect_handler=None,
+        callback_handler=None,
+    )
+    run_context = RunContext(run_id='run-url', workdir=Path.cwd(), node_id='node-4', approval_mode=HumanLoopMode.INLINE)
+    token = client.bind_run_context(run_context)
+    try:
+        result = await client._elicitation_callback(
+            None,
+            mcp_types.ElicitRequestURLParams(
+                message='Complete remote login',
+                url='https://example.com/oauth/start',
+                elicitationId='eli-1',
+            ),
+        )
+    finally:
+        client.reset_run_context(token)
+
+    assert isinstance(result, mcp_types.ElicitResult)
+    assert result.action == 'accept'
+    assert result.content is None
+    approval_context, payload = human_loop.calls[0]
+    assert approval_context.run_id == 'run-url'
+    assert approval_context.approval_mode is HumanLoopMode.DEFERRED
+    assert payload['payload']['mode'] == 'url'
+    assert payload['payload']['url_host'] == 'example.com'
 
