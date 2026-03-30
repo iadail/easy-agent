@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from typing import Any
 
 import typer
 from rich.console import Console
@@ -190,10 +191,17 @@ def inspect_federation(
 @federation_app.command('tasks')
 def list_federation_tasks(
     remote_name: str = typer.Argument(...),
+    page_token: str | None = typer.Option(None, '--page-token'),
+    page_size: int | None = typer.Option(None, '--page-size'),
     config: str = typer.Option('easy-agent.yml', '-c', '--config'),
 ) -> None:
     async def _run(runtime: EasyAgentRuntime) -> None:
-        console.print_json(json.dumps(await runtime.list_remote_tasks(remote_name), ensure_ascii=False))
+        console.print_json(
+            json.dumps(
+                await runtime.list_remote_tasks(remote_name, page_token=page_token, page_size=page_size),
+                ensure_ascii=False,
+            )
+        )
 
     asyncio.run(with_runtime(config, _run))
 
@@ -203,14 +211,23 @@ def list_federation_events(
     remote_name: str = typer.Argument(...),
     task_id: str = typer.Argument(...),
     after_sequence: int = typer.Option(0, '--after-sequence'),
+    page_token: str | None = typer.Option(None, '--page-token'),
+    page_size: int | None = typer.Option(None, '--page-size'),
     stream: bool = typer.Option(False, '--stream'),
     config: str = typer.Option('easy-agent.yml', '-c', '--config'),
 ) -> None:
     async def _run(runtime: EasyAgentRuntime) -> None:
+        payload: Any
         if stream:
             payload = await runtime.stream_remote_task_events(remote_name, task_id, after_sequence)
         else:
-            payload = await runtime.list_remote_task_events(remote_name, task_id, after_sequence)
+            payload = await runtime.list_remote_task_events(
+                remote_name,
+                task_id,
+                after_sequence,
+                page_token=page_token,
+                page_size=page_size,
+            )
         console.print_json(json.dumps(payload, ensure_ascii=False))
 
     asyncio.run(with_runtime(config, _run))

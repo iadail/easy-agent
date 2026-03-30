@@ -113,6 +113,15 @@ class McpAuthType(StrEnum):
     OAUTH = 'oauth'
 
 
+class FederationAuthType(StrEnum):
+    NONE = 'none'
+    BEARER_ENV = 'bearer_env'
+    HEADER_ENV = 'header_env'
+    OAUTH = 'oauth'
+    OIDC = 'oidc'
+    MTLS = 'mtls'
+
+
 @dataclass(slots=True)
 class RunContext:
     run_id: str

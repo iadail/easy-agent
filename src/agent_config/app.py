@@ -7,7 +7,14 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, Field, model_validator
 
-from agent_common.models import HumanLoopMode, McpAuthType, NodeType, Protocol, TeamMode
+from agent_common.models import (
+    FederationAuthType,
+    HumanLoopMode,
+    McpAuthType,
+    NodeType,
+    Protocol,
+    TeamMode,
+)
 from agent_integrations.sandbox import SandboxMode, SandboxTarget
 
 _LOADED_ENV_FILES: set[Path] = set()
@@ -205,21 +212,96 @@ class McpServerConfig(BaseModel):
         return self
 
 
+class FederationOAuthConfig(BaseModel):
+    issuer_url: str | None = None
+    openid_config_url: str | None = None
+    authorization_url: str | None = None
+    token_url: str | None = None
+    jwks_url: str | None = None
+    audience: str | None = None
+    scopes: list[str] = Field(default_factory=list)
+
+
+class FederationMtlsConfig(BaseModel):
+    ca_cert: str | None = None
+    client_cert: str | None = None
+    client_key: str | None = None
+    server_name: str | None = None
+    insecure_skip_verify: bool = False
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.client_cert and self.client_key)
+
+
 class FederationAuthConfig(BaseModel):
-    type: McpAuthType = McpAuthType.NONE
+    type: FederationAuthType = FederationAuthType.NONE
     token_env: str | None = None
     header_env: str | None = None
     header_name: str = 'Authorization'
     value_prefix: str = 'Bearer '
+    oauth: FederationOAuthConfig = Field(default_factory=FederationOAuthConfig)
+    mtls: FederationMtlsConfig = Field(default_factory=FederationMtlsConfig)
 
     @model_validator(mode='after')
     def validate_auth(self) -> FederationAuthConfig:
-        if self.type is McpAuthType.OAUTH:
-            raise ValueError('federation auth does not support oauth yet')
-        if self.type is McpAuthType.BEARER_ENV and not self.token_env:
+        if self.type is FederationAuthType.BEARER_ENV and not self.token_env:
             raise ValueError('bearer_env auth requires token_env')
-        if self.type is McpAuthType.HEADER_ENV and not self.header_env:
+        if self.type is FederationAuthType.HEADER_ENV and not self.header_env:
             raise ValueError('header_env auth requires header_env')
+        if self.type in {FederationAuthType.OAUTH, FederationAuthType.OIDC} and not (self.token_env or self.header_env):
+            raise ValueError('oauth/oidc federation auth currently requires token_env or header_env')
+        if self.type is FederationAuthType.MTLS and not self.mtls.enabled:
+            raise ValueError('mtls federation auth requires client_cert and client_key')
+        return self
+
+
+class FederationSecuritySchemeConfig(BaseModel):
+    name: str
+    type: Literal['none', 'bearer', 'header', 'oauth2', 'oidc', 'mtls'] = 'none'
+    description: str = ''
+    header_name: str = 'Authorization'
+    bearer_format: str | None = None
+    openid_config_url: str | None = None
+    authorization_url: str | None = None
+    token_url: str | None = None
+    scopes: dict[str, str] = Field(default_factory=dict)
+    audience: str | None = None
+
+    @model_validator(mode='after')
+    def validate_scheme(self) -> FederationSecuritySchemeConfig:
+        if self.type == 'header' and not self.header_name:
+            raise ValueError('header security schemes require header_name')
+        if self.type == 'oauth2' and not self.token_url:
+            raise ValueError('oauth2 security schemes require token_url')
+        if self.type == 'oidc' and not self.openid_config_url:
+            raise ValueError('oidc security schemes require openid_config_url')
+        return self
+
+
+class FederationPushSecurityConfig(BaseModel):
+    callback_url_policy: Literal['compat', 'public_only', 'allowlist'] = 'compat'
+    callback_allowlist_hosts: list[str] = Field(default_factory=list)
+    token_env: str | None = None
+    token_header: str = 'X-A2A-Notification-Token'
+    signature_secret_env: str | None = None
+    signature_header: str = 'X-A2A-Signature'
+    signature_algorithm: str = 'hmac-sha256'
+    timestamp_header: str = 'X-A2A-Timestamp'
+    audience: str | None = None
+    audience_header: str = 'X-A2A-Callback-Audience'
+    require_signature: bool = False
+    require_audience: bool = False
+    timestamp_tolerance_seconds: int = 300
+
+    @model_validator(mode='after')
+    def validate_push_security(self) -> FederationPushSecurityConfig:
+        if self.callback_url_policy == 'allowlist' and not self.callback_allowlist_hosts:
+            raise ValueError('allowlist callback policy requires callback_allowlist_hosts')
+        if self.require_signature and not self.signature_secret_env:
+            raise ValueError('push signature requires signature_secret_env')
+        if self.require_audience and not self.audience:
+            raise ValueError('push audience validation requires audience')
         return self
 
 
@@ -243,8 +325,13 @@ class FederationExportConfig(BaseModel):
     tags: list[str] = Field(default_factory=list)
     input_modes: list[str] = Field(default_factory=lambda: ['text'])
     output_modes: list[str] = Field(default_factory=lambda: ['text'])
+    default_input_modes: list[str] = Field(default_factory=list)
+    default_output_modes: list[str] = Field(default_factory=list)
     modalities: list[str] = Field(default_factory=lambda: ['text'])
     capabilities: list[str] = Field(default_factory=list)
+    artifacts: list[dict[str, Any]] = Field(default_factory=list)
+    parts: list[dict[str, Any]] = Field(default_factory=list)
+    notification_compatibility: dict[str, Any] = Field(default_factory=dict)
 
 
 class FederationServerConfig(BaseModel):
@@ -261,6 +348,9 @@ class FederationServerConfig(BaseModel):
     retry_backoff_multiplier: float = 2.0
     well_known_path: str = '/.well-known/agent-card.json'
     legacy_well_known_path: str = '/.well-known/agent.json'
+    security_schemes: list[FederationSecuritySchemeConfig] = Field(default_factory=list)
+    security_requirements: list[dict[str, list[str]]] = Field(default_factory=list)
+    push_security: FederationPushSecurityConfig = Field(default_factory=FederationPushSecurityConfig)
 
 
 class FederationConfig(BaseModel):
@@ -275,6 +365,10 @@ class FederationConfig(BaseModel):
     @property
     def export_map(self) -> dict[str, FederationExportConfig]:
         return {item.name: item for item in self.exports}
+
+    @property
+    def security_scheme_map(self) -> dict[str, FederationSecuritySchemeConfig]:
+        return {item.name: item for item in self.server.security_schemes}
 
 
 class ContainerExecutorOptions(BaseModel):
@@ -485,10 +579,13 @@ class AppConfig(BaseModel):
     def validate_federation(self) -> AppConfig:
         remote_names = [remote.name for remote in self.federation.remotes]
         export_names = [export.name for export in self.federation.exports]
+        security_scheme_names = [item.name for item in self.federation.server.security_schemes]
         if len(remote_names) != len(set(remote_names)):
             raise ValueError('federation remote names must be unique')
         if len(export_names) != len(set(export_names)):
             raise ValueError('federation export names must be unique')
+        if len(security_scheme_names) != len(set(security_scheme_names)):
+            raise ValueError('federation security scheme names must be unique')
         for export in self.federation.exports:
             if export.target_type == 'agent' and export.target not in self.agent_map:
                 raise ValueError(f"federation export '{export.name}' references unknown agent '{export.target}'")
@@ -496,6 +593,10 @@ class AppConfig(BaseModel):
                 raise ValueError(f"federation export '{export.name}' references unknown team '{export.target}'")
             if export.target_type == 'harness' and export.target not in self.harness_map:
                 raise ValueError(f"federation export '{export.name}' references unknown harness '{export.target}'")
+        for requirement in self.federation.server.security_requirements:
+            for scheme_name in requirement:
+                if scheme_name not in self.federation.security_scheme_map:
+                    raise ValueError(f"federation security requirement references unknown scheme '{scheme_name}'")
         return self
 
 

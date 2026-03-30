@@ -296,3 +296,77 @@ def test_executor_validation_rejects_unknown_mcp_executor() -> None:
                 'mcp': [{'name': 'filesystem', 'transport': 'stdio', 'executor': 'missing'}],
             }
         )
+
+
+
+def test_federation_validation_rejects_unknown_security_requirement_scheme() -> None:
+    with pytest.raises(ValueError, match="unknown scheme 'missing'"):
+        AppConfig.model_validate(
+            {
+                'graph': {
+                    'entrypoint': 'planner',
+                    'agents': [{'name': 'planner'}],
+                    'teams': [],
+                    'nodes': [],
+                },
+                'federation': {
+                    'server': {
+                        'security_schemes': [{'name': 'known', 'type': 'bearer'}],
+                        'security_requirements': [{'missing': []}],
+                    },
+                    'exports': [{'name': 'agent_export', 'target_type': 'agent', 'target': 'planner'}],
+                },
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ('push_security', 'message'),
+    [
+        ({'callback_url_policy': 'allowlist'}, 'allowlist callback policy requires callback_allowlist_hosts'),
+        ({'require_signature': True}, 'push signature requires signature_secret_env'),
+        ({'require_audience': True}, 'push audience validation requires audience'),
+    ],
+)
+def test_federation_push_security_validation(push_security: dict[str, object], message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        AppConfig.model_validate(
+            {
+                'graph': {
+                    'entrypoint': 'planner',
+                    'agents': [{'name': 'planner'}],
+                    'teams': [],
+                    'nodes': [],
+                },
+                'federation': {
+                    'server': {'push_security': push_security},
+                    'exports': [{'name': 'agent_export', 'target_type': 'agent', 'target': 'planner'}],
+                },
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    ('auth_config', 'message'),
+    [
+        ({'type': 'oauth'}, 'oauth/oidc federation auth currently requires token_env or header_env'),
+        ({'type': 'oidc'}, 'oauth/oidc federation auth currently requires token_env or header_env'),
+        ({'type': 'mtls'}, 'mtls federation auth requires client_cert and client_key'),
+    ],
+)
+def test_federation_remote_auth_validation(auth_config: dict[str, object], message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        AppConfig.model_validate(
+            {
+                'graph': {
+                    'entrypoint': 'planner',
+                    'agents': [{'name': 'planner'}],
+                    'teams': [],
+                    'nodes': [],
+                },
+                'federation': {
+                    'remotes': [{'name': 'remote', 'base_url': 'https://remote.example/a2a', 'auth': auth_config}],
+                    'exports': [{'name': 'agent_export', 'target_type': 'agent', 'target': 'planner'}],
+                },
+            }
+        )

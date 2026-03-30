@@ -104,7 +104,9 @@ The current runtime already ships the reliability controls that were previously 
 - `federation.server` can publish local agents, teams, or harnesses as exported targets.
 - `federation.remotes` can inspect remote cards and prefer SSE push or fall back to polling with `push_preference = auto|sse|poll`.
 - Federated delivery now includes well-known discovery, persisted task event logs, SSE event streaming, webhook push delivery, retry with backoff, lease renewal, cancellation, `pushNotificationConfig` set/get/list/delete compatibility, and reconnect-safe `sendSubscribe` or resubscribe flows.
-- `agent-card` and `extended-agent-card` now expose protocol version, card schema version, modalities, declared capabilities, auth hints, retry policy, subscribe policy, well-known endpoints, and compatibility metadata.
+- `agent-card` and `extended-agent-card` now expose camelCase-first `defaultInputModes` / `defaultOutputModes`, richer artifact or part metadata, `notificationCompatibility`, pagination hints, and `securitySchemes` plus `security` requirements alongside the easy-agent compatibility fields.
+- Remote inspection stays available even when a remote requires auth that this client is not configured to satisfy, while actionable calls now fail fast with card-driven readiness checks for bearer, header, OAuth/OIDC, callback audience or signature expectations, and optional client-side mTLS handshakes.
+- Federated task and event listing now support cursor pagination through `pageToken` / `nextPageToken`, and the CLI accepts `--page-token` / `--page-size` for `easy-agent federation tasks` and `easy-agent federation events`.
 - Federated task state plus subscription state is persisted in SQLite so remote execution, backlog replay, and push delivery can be inspected after the initial request completes.
 - The CLI now exposes `easy-agent federation list|inspect|tasks|events|cancel-task|subscriptions|renew-subscription|cancel-subscription|push-set|push-get|push-list|push-delete|send-subscribe|resubscribe|serve`.
 
@@ -122,6 +124,19 @@ federation:
     card_schema_version: "1.0"
     retry_max_attempts: 4
     retry_initial_backoff_seconds: 0.5
+    security_schemes:
+      - name: oidc_main
+        type: oidc
+        openid_config_url: https://login.example.com/.well-known/openid-configuration
+        audience: https://agent.example.com/a2a
+    security_requirements:
+      - oidc_main: []
+    push_security:
+      callback_url_policy: public_only
+      signature_secret_env: FEDERATION_CALLBACK_SECRET
+      require_signature: true
+      audience: repo-delivery-callback
+      require_audience: true
   exports:
     - name: repo_delivery
       target_type: harness
@@ -133,8 +148,11 @@ federation:
       base_url: https://partner.example.com/a2a
       push_preference: auto
       auth:
-        type: bearer_env
+        type: oidc
         token_env: PARTNER_AGENT_TOKEN
+        oauth:
+          audience: https://partner.example.com/a2a
+          openid_config_url: https://login.partner.example.com/.well-known/openid-configuration
 ```
 
 ## Executor / Workbench Isolation
@@ -368,30 +386,31 @@ This snapshot combines fresh static checks, a fresh focused real-network pytest 
 | Static checks | `.\.venv\Scripts\python.exe -m ruff check src tests scripts` | passed |
 | Typing | `.\.venv\Scripts\python.exe -m mypy src tests scripts` | passed |
 | Focused real-network pytest | `.\.venv\Scripts\python.exe -m pytest tests/integration/test_real_network_eval.py -m real -q` | `1 passed` |
-| Targeted manual Python verification | repo-local script writing `.easy-agent/manual-verify/20260330-github-fed/manual-verification-report.json` | passed |
+| Targeted manual Python verification | repo-local Python harness covering federation pagination, signed callbacks, security-readiness gates, config validation, and loopback federation scenarios | passed |
+| Federation CLI pagination smoke | repo-local `CliRunner` loopback smoke for `federation tasks --page-size` and `federation events --page-size` | passed |
 | Live real-network artifact | `.easy-agent/real-network-report.json` | refreshed on March 30, 2026 |
 | Live benchmark artifact | `.easy-agent/benchmark-report.json` | retained March 27, 2026 snapshot |
 | Live public-eval artifact | `.easy-agent/public-eval-report.json` | retained March 30, 2026 snapshot |
 
-The manual Python verification pass covered the new GitHub automation helpers, optional local skill loading, duplicate-call suppression for optional-only argument supersets, tau history grounding helpers, and federation auto-discovery before `run_remote()`.
+The manual Python verification pass covered federation loopback delivery, signed callback retries, remote security-readiness gating, config validation, and CLI pagination against a local loopback server.
 
 ### Real Network Matrix
 
 | Scenario | Transport | Status | Duration (s) | Notes |
 | --- | --- | --- | --- | --- |
-| `cross_process_federation` | `http_poll` | passed | `0.7481` | cross-process well-known discovery and send/poll federation passed |
-| `live_model_federation_roundtrip` | `http_poll` | skipped | `6.9997` | live-model loopback path reached the new row, but the provider connection failed in this session before the remote agent could answer |
-| `disconnect_retry_chaos` | `http_webhook` | passed | `4.1800` | callback retry, `pushNotificationConfig`, `sendSubscribe`, and resubscribe passed |
-| `duplicate_delivery_replay_resilience` | `http_webhook` | passed | `3.6405` | duplicate delivery and replay reads preserved a stable federated task event log |
-| `workbench_reuse_process` | `local_process` | passed | `2.3959` | process workbench reused the same long-lived session root |
-| `workbench_reuse_container` | `podman_exec` | skipped | `3.4967` | host Podman credentials were not readable in this session |
-| `workbench_incremental_snapshot_reuse_container` | `podman_exec` | skipped | `3.4215` | host Podman credentials were not readable in this session |
-| `workbench_reuse_microvm` | `podman_machine_ssh` | skipped | `0.1807` | podman-machine lock or identity paths were denied on this host |
-| `workbench_incremental_snapshot_reuse_microvm` | `podman_machine_ssh` | skipped | `0.1905` | podman-machine lock or identity paths were denied on this host |
-| `replay_resume_failure_injection` | `sqlite_checkpoint` | passed | `9.0014` | resume, replay, and fork recovery passed under injected failure |
+| `cross_process_federation` | `http_poll` | passed | `0.7284` | cross-process well-known discovery and send/poll federation passed |
+| `live_model_federation_roundtrip` | `http_poll` | skipped | `33.6338` | live-model loopback reached the matrix, but all provider connection attempts failed in this session |
+| `disconnect_retry_chaos` | `http_webhook` | passed | `6.1782` | callback retry, `pushNotificationConfig`, `sendSubscribe`, signed webhook delivery, and resubscribe passed |
+| `duplicate_delivery_replay_resilience` | `http_webhook` | passed | `3.1928` | duplicate delivery, signed callback replay, and stable federated task event logs passed |
+| `workbench_reuse_process` | `local_process` | passed | `1.7963` | process workbench reused the same long-lived session root |
+| `workbench_reuse_container` | `podman_exec` | skipped | `2.3622` | host Podman credentials or identity paths were denied in this session |
+| `workbench_incremental_snapshot_reuse_container` | `podman_exec` | skipped | `2.5919` | host Podman credentials or identity paths were denied in this session |
+| `workbench_reuse_microvm` | `podman_machine_ssh` | skipped | `0.1793` | podman-machine lock or identity paths were denied on this host |
+| `workbench_incremental_snapshot_reuse_microvm` | `podman_machine_ssh` | skipped | `0.1897` | podman-machine lock or identity paths were denied on this host |
+| `replay_resume_failure_injection` | `sqlite_checkpoint` | passed | `4.9222` | resume, replay, and fork recovery passed under injected failure |
 
 Summary: `5 passed`, `0 failed`, `5 skipped`.
-Source: `.easy-agent/real-network-report.json` generated at `2026-03-30T07:29:01Z`.
+Source: `.easy-agent/real-network-report.json` generated at `2026-03-30T09:27:27Z`.
 
 ### Live Benchmark Snapshot
 
@@ -430,12 +449,12 @@ Current caveats:
 
 These next steps are based on the current public A2A and MCP protocol surfaces, not just internal backlog notes.
 
-- Push federation card and task negotiation closer to the latest public A2A surface by adding richer artifact or part-level modality declarations, `ListTasks` or `ListTaskEvents` cursor pagination (`pageToken` / `nextPageToken`), and clearer notification compatibility metadata around push delivery.
-- Harden federation security toward production-grade remote trust with stronger auth scheme hints, signed callback verification, OAuth or OIDC flows, callback audience validation, and optional mTLS between agent servers.
-- Expand MCP capability negotiation from the current roots support to full `roots/list_changed` flows plus stronger `streamable_http` reconnect, auth-refresh, and server-initiated lifecycle handling.
-- Extend MCP sampling and elicitation beyond the current text-first bridge so low-risk requests can preserve richer structured content blocks or form payloads when the provider and runtime support them, while high-risk remote requests remain deferred behind human approval.
+- Continue aligning federation with the latest public A2A surface by adding camelCase-first card serialization, authenticated extended-card variants, `supportedInterfaces`, JWS `signatures`, and fuller `ListTaskPushNotificationConfigs` or task-list filtering support such as `includeArtifacts`, `historyLength`, and `statusTimestampAfter` where they fit the runtime model.
+- Push federation trust past the current readiness checks by adding real OAuth/OIDC token acquisition and refresh, callback-receiver verification helpers, optional JWK or JWS verification for signed cards, and stricter authorization scoping around tenant, audience, and task visibility.
+- Expand MCP roots from the current list handling to full `notifications/roots/list_changed` propagation and root-diff reconciliation, matching the latest MCP roots capability shape more closely.
+- Extend MCP elicitation and sampling around the newer MCP surface by handling URL-mode `URLElicitationRequiredError`, preserving explicit `accept` / `decline` / `cancel` outcomes, and retaining richer multimodal sampling or tool-result content under the same human-approval policy.
 - Add stage-aware public-eval analytics, per-provider schema compatibility matrices, and stronger regression fixtures for duplicate-call suppression, history-grounding, and OpenAI-compatible fallback paths.
-- Turn the newly added real-network rows from `skipped` into stable `passed` coverage on provisioned hosts by preflighting live-model connectivity, Podman identity access, and container or microVM delta-snapshot warm caches.
+- Turn the still-skipped real-network rows into stable `passed` coverage on provisioned hosts by preflighting live-model connectivity, Podman identity access, and container or microVM delta-snapshot warm caches.
 
 ## Design References
 

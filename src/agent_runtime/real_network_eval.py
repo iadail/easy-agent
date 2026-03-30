@@ -25,6 +25,7 @@ from agent_config.app import (
 )
 from agent_integrations.executors import build_executor_backends
 from agent_integrations.federation import FederationClientManager, FederationServer
+from agent_integrations.federation_security import verify_callback_headers
 from agent_integrations.sandbox import SandboxManager, SandboxMode, SandboxTarget
 from agent_integrations.storage import SQLiteRunStore
 from agent_integrations.workbench import WorkbenchManager
@@ -46,7 +47,7 @@ class _CallbackCollector:
     def __init__(self, fail_first: bool = False) -> None:
         self.fail_first = fail_first
         self.attempts = 0
-        self.deliveries: list[dict[str, Any]] = []
+        self.requests: list[dict[str, Any]] = []
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -60,9 +61,17 @@ class _CallbackCollector:
 
             def do_POST(self) -> None:  # noqa: N802
                 length = int(self.headers.get('Content-Length', '0') or '0')
-                payload = json.loads(self.rfile.read(length).decode('utf-8')) if length else {}
+                raw = self.rfile.read(length) if length else b''
+                payload = json.loads(raw.decode('utf-8')) if raw else {}
                 collector.attempts += 1
-                collector.deliveries.append(payload)
+                collector.requests.append(
+                    {
+                        'path': self.path,
+                        'payload': payload,
+                        'raw': raw,
+                        'headers': {key: value for key, value in self.headers.items()},
+                    }
+                )
                 status = HTTPStatus.INTERNAL_SERVER_ERROR if collector.fail_first and collector.attempts == 1 else HTTPStatus.OK
                 self.send_response(status)
                 self.end_headers()
@@ -84,21 +93,24 @@ class _CallbackCollector:
 
 
 class _FakeRuntime:
-    def __init__(self, tmp_path: Path) -> None:
+    def __init__(self, tmp_path: Path, *, server_overrides: dict[str, Any] | None = None) -> None:
+        server_config = {
+            'enabled': True,
+            'host': '127.0.0.1',
+            'port': 0,
+            'base_path': '/a2a',
+            'retry_max_attempts': 3,
+            'retry_initial_backoff_seconds': 0.1,
+            'retry_backoff_multiplier': 1.0,
+            'subscription_lease_seconds': 30,
+        }
+        if server_overrides:
+            server_config.update(server_overrides)
         self.config = AppConfig.model_validate(
             {
                 'graph': {'entrypoint': 'coordinator', 'agents': [{'name': 'coordinator'}], 'teams': [], 'nodes': []},
                 'federation': {
-                    'server': {
-                        'enabled': True,
-                        'host': '127.0.0.1',
-                        'port': 0,
-                        'base_path': '/a2a',
-                        'retry_max_attempts': 3,
-                        'retry_initial_backoff_seconds': 0.1,
-                        'retry_backoff_multiplier': 1.0,
-                        'subscription_lease_seconds': 30,
-                    },
+                    'server': server_config,
                     'exports': [
                         {
                             'name': 'local_echo',
@@ -129,6 +141,18 @@ class _FakeRuntime:
     def interrupt_run(self, run_id: str, payload: dict[str, Any] | None = None) -> None:
         del run_id, payload
         return None
+
+
+def _signed_push_server_overrides() -> dict[str, Any]:
+    return {
+        'push_security': {
+            'token_env': 'EASY_AGENT_PUSH_TOKEN',
+            'signature_secret_env': 'EASY_AGENT_PUSH_SECRET',
+            'require_signature': True,
+            'audience': 'easy-agent-real-network',
+            'require_audience': True,
+        }
+    }
 
 
 _CROSS_PROCESS_SERVER = textwrap.dedent(
@@ -415,7 +439,11 @@ def _scenario_live_model_federation_roundtrip(base_config: AppConfig, tmp_path: 
 
 
 def _scenario_federation_retry_and_reconnect(tmp_path: Path) -> str:
-    runtime = _FakeRuntime(tmp_path)
+    previous_secret = os.environ.get('EASY_AGENT_PUSH_SECRET')
+    previous_token = os.environ.get('EASY_AGENT_PUSH_TOKEN')
+    os.environ['EASY_AGENT_PUSH_SECRET'] = 'real-network-secret'
+    os.environ['EASY_AGENT_PUSH_TOKEN'] = 'real-network-token'
+    runtime = _FakeRuntime(tmp_path, server_overrides=_signed_push_server_overrides())
     server = FederationServer(runtime)
     callback = _CallbackCollector(fail_first=True)
     callback_url = callback.start()
@@ -454,7 +482,20 @@ def _scenario_federation_retry_and_reconnect(tmp_path: Path) -> str:
                 raise AssertionError('subscription lifecycle mismatch')
             if callback.attempts < 2:
                 raise AssertionError('retry backoff was not exercised')
-            return 'callback retry, pushNotificationConfig, sendSubscribe, and resubscribe passed'
+            if not callback.requests:
+                raise AssertionError('expected at least one callback request')
+            last_request = callback.requests[-1]
+            verify_callback_headers(
+                last_request['headers'],
+                last_request['raw'],
+                last_request['path'],
+                runtime.config.federation.server.push_security,
+                expected_secret='real-network-secret',
+                expected_audience='easy-agent-real-network',
+            )
+            if last_request['headers'].get('X-A2A-Notification-Token') != 'real-network-token':
+                raise AssertionError('missing callback token header')
+            return 'callback retry, pushNotificationConfig, sendSubscribe, signed webhook delivery, and resubscribe passed'
         finally:
             await manager.aclose()
 
@@ -463,6 +504,14 @@ def _scenario_federation_retry_and_reconnect(tmp_path: Path) -> str:
     finally:
         callback.stop()
         server.stop()
+        if previous_secret is None:
+            os.environ.pop('EASY_AGENT_PUSH_SECRET', None)
+        else:
+            os.environ['EASY_AGENT_PUSH_SECRET'] = previous_secret
+        if previous_token is None:
+            os.environ.pop('EASY_AGENT_PUSH_TOKEN', None)
+        else:
+            os.environ['EASY_AGENT_PUSH_TOKEN'] = previous_token
 
 
 def _workbench_manager(base_path: Path, executors: list[ExecutorConfig], default_executor: str) -> WorkbenchManager:
@@ -591,7 +640,11 @@ def _scenario_microvm_workbench_reuse(tmp_path: Path) -> str:
 
 
 def _scenario_duplicate_delivery_replay_resilience(tmp_path: Path) -> str:
-    runtime = _FakeRuntime(tmp_path)
+    previous_secret = os.environ.get('EASY_AGENT_PUSH_SECRET')
+    previous_token = os.environ.get('EASY_AGENT_PUSH_TOKEN')
+    os.environ['EASY_AGENT_PUSH_SECRET'] = 'real-network-secret'
+    os.environ['EASY_AGENT_PUSH_TOKEN'] = 'real-network-token'
+    runtime = _FakeRuntime(tmp_path, server_overrides=_signed_push_server_overrides())
     server = FederationServer(runtime)
     callback = _CallbackCollector()
     callback_url = callback.start()
@@ -621,22 +674,33 @@ def _scenario_duplicate_delivery_replay_resilience(tmp_path: Path) -> str:
                 await asyncio.sleep(0.1)
             if task_payload is None or task_payload['status'] != 'succeeded':
                 raise AssertionError('task did not reach a terminal state')
-            events_before = await manager.list_task_events('loopback', task_id, after_sequence=0)
+            events_before = await manager.list_task_events('loopback', task_id, after_sequence=0, page_size=10)
             replay_full = await manager.resubscribe_task('loopback', task_id, from_sequence=0)
             replay_tail = await manager.resubscribe_task('loopback', task_id, from_sequence=1)
-            events_after = await manager.list_task_events('loopback', task_id, after_sequence=0)
-            sequences_before = [int(item['sequence']) for item in events_before]
+            events_after = await manager.list_task_events('loopback', task_id, after_sequence=0, page_size=10)
+            sequences_before = [int(item['sequence']) for item in events_before['events']]
             if sequences_before != sorted(set(sequences_before)):
                 raise AssertionError('event sequences are not unique and ordered')
             if [int(item['sequence']) for item in replay_full['events']] != sequences_before:
                 raise AssertionError('full replay did not preserve the event backlog')
             if any(int(item['sequence']) <= 1 for item in replay_tail['events']):
                 raise AssertionError('tail replay returned duplicate early events')
-            if len(events_before) != len(events_after):
+            if len(events_before['events']) != len(events_after['events']):
                 raise AssertionError('replay mutated the persisted task event log')
-            if callback.deliveries[-1]['events'][-1]['event_kind'] != 'task_succeeded':
+            if not callback.requests:
+                raise AssertionError('expected a callback delivery')
+            last_request = callback.requests[-1]
+            verify_callback_headers(
+                last_request['headers'],
+                last_request['raw'],
+                last_request['path'],
+                runtime.config.federation.server.push_security,
+                expected_secret='real-network-secret',
+                expected_audience='easy-agent-real-network',
+            )
+            if last_request['payload']['events'][-1]['event_kind'] != 'task_succeeded':
                 raise AssertionError('callback delivery did not capture the terminal event')
-            return 'duplicate delivery and replay reads preserved a stable federated task event log'
+            return 'duplicate delivery, signed callback replay, and stable federated task event logs passed'
         finally:
             await manager.aclose()
 
@@ -645,6 +709,14 @@ def _scenario_duplicate_delivery_replay_resilience(tmp_path: Path) -> str:
     finally:
         callback.stop()
         server.stop()
+        if previous_secret is None:
+            os.environ.pop('EASY_AGENT_PUSH_SECRET', None)
+        else:
+            os.environ['EASY_AGENT_PUSH_SECRET'] = previous_secret
+        if previous_token is None:
+            os.environ.pop('EASY_AGENT_PUSH_TOKEN', None)
+        else:
+            os.environ['EASY_AGENT_PUSH_TOKEN'] = previous_token
 
 
 

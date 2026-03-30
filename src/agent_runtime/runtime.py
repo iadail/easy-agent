@@ -384,10 +384,16 @@ class EasyAgentRuntime:
             await self.start()
         return await self.federation_manager.inspect_remote(remote_name)
 
-    async def list_remote_tasks(self, remote_name: str) -> list[dict[str, Any]]:
+    async def list_remote_tasks(
+        self,
+        remote_name: str,
+        *,
+        page_token: str | None = None,
+        page_size: int | None = None,
+    ) -> dict[str, Any]:
         if not self._started:
             await self.start()
-        return await self.federation_manager.list_tasks(remote_name)
+        return await self.federation_manager.list_tasks(remote_name, page_token=page_token, page_size=page_size)
 
     async def get_remote_task(self, remote_name: str, task_id: str) -> dict[str, Any]:
         if not self._started:
@@ -414,10 +420,19 @@ class EasyAgentRuntime:
         remote_name: str,
         task_id: str,
         after_sequence: int = 0,
-    ) -> list[dict[str, Any]]:
+        *,
+        page_token: str | None = None,
+        page_size: int | None = None,
+    ) -> dict[str, Any]:
         if not self._started:
             await self.start()
-        return await self.federation_manager.list_task_events(remote_name, task_id, after_sequence)
+        return await self.federation_manager.list_task_events(
+            remote_name,
+            task_id,
+            after_sequence,
+            page_token=page_token,
+            page_size=page_size,
+        )
 
     async def list_remote_subscriptions(self, remote_name: str, task_id: str) -> list[dict[str, Any]]:
         if not self._started:

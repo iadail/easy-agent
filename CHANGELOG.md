@@ -12,6 +12,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Added `src/agent_common/schema_utils.py` so protocol adapters, MCP integration, and public-eval all reuse the same JSON-schema normalization rules.
 - Added risk-aware MCP sampling and elicitation handling with deferred approval escalation for high-risk remote requests plus richer form / URL elicitation payload processing.
 - Added provider-aware BFCL fallback tracking in public eval with `fallback_stage`, `fallback_attempts`, and candidate-pruned retry paths for OpenAI-compatible `400` responses.
+- Added federation security negotiation helpers for `securitySchemes` / `security`, callback signing plus audience headers, cursor page-token encoding, and optional client-side mTLS handshake kwargs.
 - Added `src/agent_integrations/github_automation.py` with local GitHub automation helpers for:
   - `github_issue_list`
   - `github_issue_prepare_fix`
@@ -32,14 +33,15 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Tightened duplicate successful tool-call suppression so a second call that only adds optional schema-declared arguments reuses the first successful result instead of executing again.
 - Grounded tau public-eval cases more aggressively from prior tool history by extracting known task ids into a synthetic memory message.
 - Hardened federation client delivery so `run_remote()` auto-discovers the remote base path before sending tasks, and fixed the real-network replay resilience scenario to read the task payload returned by `get_task()` correctly.
-- Refreshed the bilingual README pair for the March 30, 2026 verification pass, added local GitHub automation setup notes, and synchronized the refreshed real-network matrix while explicitly keeping the older benchmark and public-eval artifacts marked as retained snapshots.
+- Extended federation client and server negotiation with richer `agent-card` / `extended-agent-card` metadata, `ListTasks` / `ListTaskEvents` cursor pagination, signed webhook delivery, callback audience handling, and fail-fast remote auth readiness checks for bearer, header, OAuth/OIDC, and optional mTLS paths.
+- Refreshed the bilingual README pair for the March 30, 2026 verification pass, synchronized the latest real-network matrix, and rewrote `Next Reinforcement` against the latest public A2A and MCP protocol surfaces while keeping the older benchmark and public-eval artifacts marked as retained snapshots.
 
 ### Verified
 
 - `.\.venv\Scripts\python.exe -m ruff check src tests scripts`
 - `.\.venv\Scripts\python.exe -m mypy src tests scripts`
 - `.\.venv\Scripts\python.exe -m pytest tests/integration/test_real_network_eval.py -m real -q` with `1 passed`
-- Repo-local Python verification wrote `.easy-agent/manual-verify/20260330-github-fed/manual-verification-report.json` and passed coverage for GitHub automation helpers, optional skill loading, duplicate-call suppression, tau history grounding, and federation auto-discovery.
+- Repo-local Python harnesses passed coverage for federation loopback delivery, signed callback retry and audience verification, remote security-readiness gates, config validation, and loopback CLI pagination smoke.
 - `.easy-agent/real-network-report.json` was refreshed with `5 passed`, `0 failed`, and `5 skipped` across 10 scenarios.
 
 ## [0.3.2] - 2026-03-27

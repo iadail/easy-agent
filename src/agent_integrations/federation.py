@@ -16,10 +16,19 @@ from urllib.parse import parse_qs, urlparse
 
 import httpx
 
-from agent_common.models import RunStatus, ToolSpec
+from agent_common.models import FederationAuthType, RunStatus, ToolSpec
 from agent_common.tools import ToolRegistry
 from agent_common.version import runtime_version
 from agent_config.app import FederationConfig, FederationExportConfig, FederationRemoteConfig
+from agent_integrations.federation_security import (
+    build_auth_hint_payload,
+    build_callback_headers,
+    build_mtls_client_kwargs,
+    build_security_scheme_payload,
+    decode_page_token,
+    encode_page_token,
+    validate_callback_url,
+)
 from agent_integrations.storage import SQLiteRunStore
 
 TERMINAL_TASK_STATUSES = {
@@ -50,6 +59,63 @@ def _safe_json(response: httpx.Response) -> dict[str, Any]:
     return cast(dict[str, Any], response.json())
 
 
+def _page_size(value: int | None, *, default: int = 50, maximum: int = 200) -> int:
+    if value is None:
+        return default
+    return max(1, min(int(value), maximum))
+
+
+def _pagination_params(page_token: str | None = None, page_size: int | None = None) -> dict[str, Any]:
+    params: dict[str, Any] = {}
+    if page_token:
+        params['pageToken'] = page_token
+    if page_size is not None:
+        params['pageSize'] = page_size
+    return params
+
+
+def _paginate_tasks_payload(tasks: list[dict[str, Any]], page_token: str | None, page_size: int | None) -> dict[str, Any]:
+    ordered = sorted(tasks, key=lambda item: (str(item.get('created_at', '')), str(item.get('task_id', ''))))
+    start_index = 0
+    if page_token:
+        cursor = decode_page_token(page_token, 'tasks')
+        after = (str(cursor.get('created_at', '')), str(cursor.get('task_id', '')))
+        for index, item in enumerate(ordered):
+            current = (str(item.get('created_at', '')), str(item.get('task_id', '')))
+            if current > after:
+                start_index = index
+                break
+        else:
+            start_index = len(ordered)
+    size = _page_size(page_size)
+    items = ordered[start_index : start_index + size]
+    next_token: str | None = None
+    if start_index + size < len(ordered) and items:
+        tail = items[-1]
+        next_token = encode_page_token('tasks', {'created_at': tail.get('created_at'), 'task_id': tail.get('task_id')})
+    return {'tasks': items, 'nextPageToken': next_token}
+
+
+def _paginate_events_payload(events: list[dict[str, Any]], page_token: str | None, page_size: int | None) -> dict[str, Any]:
+    ordered = sorted(events, key=lambda item: int(item.get('sequence', 0)))
+    start_index = 0
+    if page_token:
+        cursor = decode_page_token(page_token, 'task-events')
+        after_sequence = int(cursor.get('sequence', 0))
+        for index, item in enumerate(ordered):
+            if int(item.get('sequence', 0)) > after_sequence:
+                start_index = index
+                break
+        else:
+            start_index = len(ordered)
+    size = _page_size(page_size)
+    items = ordered[start_index : start_index + size]
+    next_token: str | None = None
+    if start_index + size < len(ordered) and items:
+        next_token = encode_page_token('task-events', {'sequence': int(items[-1].get('sequence', 0))})
+    return {'events': items, 'nextPageToken': next_token}
+
+
 class FederationClientManager:
     def __init__(self, config: FederationConfig, store: SQLiteRunStore | None = None) -> None:
         self.config = config
@@ -68,6 +134,7 @@ class FederationClientManager:
                 base_url=remote.base_url.rstrip('/'),
                 timeout=remote.timeout_seconds,
                 headers=self._build_headers(remote),
+                **build_mtls_client_kwargs(remote.auth.mtls),
             )
         self._started = True
 
@@ -140,7 +207,7 @@ class FederationClientManager:
         session_id: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        await self._ensure_remote_metadata(remote_name)
+        await self._ensure_remote_ready(remote_name)
         response = await self._client(remote_name).post(
             _join_url(self._base_path(remote_name), '/tasks/send'),
             json={
@@ -167,7 +234,7 @@ class FederationClientManager:
         session_id: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        await self._ensure_remote_metadata(remote_name)
+        await self._ensure_remote_ready(remote_name)
         client = self._client(remote_name)
         payload = {
             'target': target,
@@ -193,30 +260,57 @@ class FederationClientManager:
         return events
 
     async def get_task(self, remote_name: str, task_id: str) -> dict[str, Any]:
-        await self._ensure_remote_metadata(remote_name)
+        await self._ensure_remote_ready(remote_name)
         response = await self._client(remote_name).get(_join_url(self._base_path(remote_name), f'/tasks/{task_id}'))
         payload = _safe_json(response)
         return cast(dict[str, Any], payload['task'])
 
-    async def list_tasks(self, remote_name: str) -> list[dict[str, Any]]:
-        await self._ensure_remote_metadata(remote_name)
-        response = await self._client(remote_name).get(_join_url(self._base_path(remote_name), '/tasks'))
-        payload = _safe_json(response)
-        return cast(list[dict[str, Any]], payload['tasks'])
-
-    async def list_task_events(self, remote_name: str, task_id: str, after_sequence: int = 0) -> list[dict[str, Any]]:
-        await self._ensure_remote_metadata(remote_name)
+    async def list_tasks(
+        self,
+        remote_name: str,
+        *,
+        page_token: str | None = None,
+        page_size: int | None = None,
+    ) -> dict[str, Any]:
+        await self._ensure_remote_ready(remote_name)
         response = await self._client(remote_name).get(
-            _join_url(self._base_path(remote_name), f'/tasks/{task_id}/events'),
-            params={'after_sequence': after_sequence},
+            _join_url(self._base_path(remote_name), '/tasks'),
+            params=_pagination_params(page_token, page_size),
         )
         payload = _safe_json(response)
-        return cast(list[dict[str, Any]], payload['events'])
+        return {
+            'tasks': cast(list[dict[str, Any]], payload.get('tasks', [])),
+            'nextPageToken': cast(str | None, payload.get('nextPageToken')),
+        }
+
+    async def list_task_events(
+        self,
+        remote_name: str,
+        task_id: str,
+        after_sequence: int = 0,
+        *,
+        page_token: str | None = None,
+        page_size: int | None = None,
+    ) -> dict[str, Any]:
+        await self._ensure_remote_ready(remote_name)
+        params = _pagination_params(page_token, page_size)
+        if not page_token and after_sequence > 0:
+            params['after_sequence'] = after_sequence
+        response = await self._client(remote_name).get(
+            _join_url(self._base_path(remote_name), f'/tasks/{task_id}/events'),
+            params=params,
+        )
+        payload = _safe_json(response)
+        return {
+            'events': cast(list[dict[str, Any]], payload.get('events', [])),
+            'nextPageToken': cast(str | None, payload.get('nextPageToken')),
+        }
 
     async def stream_task_events(self, remote_name: str, task_id: str, after_sequence: int = 0) -> list[dict[str, Any]]:
         latest_task = await self.get_task(remote_name, task_id)
         if str(latest_task['status']) in TERMINAL_TASK_STATUSES:
-            terminal_events = await self.list_task_events(remote_name, task_id, after_sequence)
+            terminal_payload = await self.list_task_events(remote_name, task_id, after_sequence)
+            terminal_events = cast(list[dict[str, Any]], terminal_payload.get('events', []))
             for event in terminal_events:
                 event.setdefault('event_name', str(event.get('event_kind', 'task_event')))
             return terminal_events
@@ -256,14 +350,15 @@ class FederationClientManager:
                 await asyncio.sleep(self._remote(remote_name).sse_reconnect_seconds)
                 continue
             break
-        backlog = await self.list_task_events(remote_name, task_id, current_after)
+        backlog_payload = await self.list_task_events(remote_name, task_id, current_after)
+        backlog = cast(list[dict[str, Any]], backlog_payload.get('events', []))
         for event in backlog:
             event.setdefault('event_name', str(event.get('event_kind', 'task_event')))
             events.append(event)
         return events
 
     async def cancel_task(self, remote_name: str, task_id: str) -> dict[str, Any]:
-        await self._ensure_remote_metadata(remote_name)
+        await self._ensure_remote_ready(remote_name)
         client = self._client(remote_name)
         for path in (f'/tasks/{task_id}:cancel', f'/tasks/{task_id}/cancel'):
             response = await client.post(_join_url(self._base_path(remote_name), path), json={})
@@ -282,7 +377,7 @@ class FederationClientManager:
         lease_seconds: int | None = None,
         from_sequence: int = 0,
     ) -> dict[str, Any]:
-        await self._ensure_remote_metadata(remote_name)
+        await self._ensure_remote_ready(remote_name)
         client = self._client(remote_name)
         payload = {'callback_url': callback_url, 'lease_seconds': lease_seconds, 'from_sequence': from_sequence}
         for path in (f'/tasks/{task_id}:subscribe', f'/tasks/{task_id}/subscribe'):
@@ -294,7 +389,7 @@ class FederationClientManager:
         raise RuntimeError(f'remote task subscribe route not found for {remote_name}')
 
     async def list_subscriptions(self, remote_name: str, task_id: str) -> list[dict[str, Any]]:
-        await self._ensure_remote_metadata(remote_name)
+        await self._ensure_remote_ready(remote_name)
         response = await self._client(remote_name).get(_join_url(self._base_path(remote_name), f'/tasks/{task_id}/subscriptions'))
         payload = _safe_json(response)
         return cast(list[dict[str, Any]], payload['subscriptions'])
@@ -307,7 +402,7 @@ class FederationClientManager:
         *,
         lease_seconds: int | None = None,
     ) -> dict[str, Any]:
-        await self._ensure_remote_metadata(remote_name)
+        await self._ensure_remote_ready(remote_name)
         response = await self._client(remote_name).post(
             _join_url(self._base_path(remote_name), f'/tasks/{task_id}/subscriptions/{subscription_id}/renew'),
             json={'lease_seconds': lease_seconds},
@@ -316,7 +411,7 @@ class FederationClientManager:
         return cast(dict[str, Any], payload['subscription'])
 
     async def cancel_subscription(self, remote_name: str, task_id: str, subscription_id: str) -> dict[str, Any]:
-        await self._ensure_remote_metadata(remote_name)
+        await self._ensure_remote_ready(remote_name)
         response = await self._client(remote_name).post(
             _join_url(self._base_path(remote_name), f'/tasks/{task_id}/subscriptions/{subscription_id}/cancel'),
             json={},
@@ -333,7 +428,7 @@ class FederationClientManager:
         lease_seconds: int | None = None,
         from_sequence: int = 0,
     ) -> dict[str, Any]:
-        await self._ensure_remote_metadata(remote_name)
+        await self._ensure_remote_ready(remote_name)
         client = self._client(remote_name)
         payload = {'callback_url': callback_url, 'lease_seconds': lease_seconds, 'from_sequence': from_sequence}
         candidates = (
@@ -349,7 +444,7 @@ class FederationClientManager:
         raise RuntimeError(f'push notification set route not found for {remote_name}')
 
     async def get_push_notification(self, remote_name: str, task_id: str, config_id: str) -> dict[str, Any]:
-        await self._ensure_remote_metadata(remote_name)
+        await self._ensure_remote_ready(remote_name)
         client = self._client(remote_name)
         candidates = (
             ('GET', _join_url(self._push_path(remote_name), f'/tasks/{task_id}/pushNotificationConfigs/{config_id}'), None),
@@ -364,7 +459,7 @@ class FederationClientManager:
         raise RuntimeError(f'push notification get route not found for {remote_name}')
 
     async def list_push_notifications(self, remote_name: str, task_id: str) -> list[dict[str, Any]]:
-        await self._ensure_remote_metadata(remote_name)
+        await self._ensure_remote_ready(remote_name)
         client = self._client(remote_name)
         candidates = (
             _join_url(self._push_path(remote_name), f'/tasks/{task_id}/pushNotificationConfigs'),
@@ -379,7 +474,7 @@ class FederationClientManager:
         raise RuntimeError(f'push notification list route not found for {remote_name}')
 
     async def delete_push_notification(self, remote_name: str, task_id: str, config_id: str) -> dict[str, Any]:
-        await self._ensure_remote_metadata(remote_name)
+        await self._ensure_remote_ready(remote_name)
         client = self._client(remote_name)
         candidates = (
             ('DELETE', _join_url(self._push_path(remote_name), f'/tasks/{task_id}/pushNotificationConfigs/{config_id}'), None),
@@ -405,7 +500,7 @@ class FederationClientManager:
         lease_seconds: int | None = None,
         from_sequence: int = 0,
     ) -> dict[str, Any]:
-        await self._ensure_remote_metadata(remote_name)
+        await self._ensure_remote_ready(remote_name)
         client = self._client(remote_name)
         payload = {
             'target': target,
@@ -440,7 +535,7 @@ class FederationClientManager:
         callback_url: str | None = None,
         lease_seconds: int | None = None,
     ) -> dict[str, Any]:
-        await self._ensure_remote_metadata(remote_name)
+        await self._ensure_remote_ready(remote_name)
         client = self._client(remote_name)
         payload = {
             'task_id': task_id,
@@ -458,7 +553,8 @@ class FederationClientManager:
                 continue
             body = _safe_json(response)
             task = cast(dict[str, Any], body.get('task') or await self.get_task(remote_name, task_id))
-            events = cast(list[dict[str, Any]], body.get('events') or await self.list_task_events(remote_name, task_id, from_sequence))
+            event_payload = body if 'events' in body else await self.list_task_events(remote_name, task_id, from_sequence)
+            events = cast(list[dict[str, Any]], event_payload.get('events', []))
             subscription = cast(dict[str, Any], body.get('push_notification_config') or body.get('subscription', {}))
             return {'task': task, 'events': events, 'subscription': subscription}
         raise RuntimeError(f'resubscribe route not found for {remote_name}')
@@ -620,15 +716,111 @@ class FederationClientManager:
                 return f'{parsed.scheme}://{parsed.netloc}{base_path}'
         return text
 
+    async def _ensure_remote_ready(self, remote_name: str) -> None:
+        await self._ensure_remote_metadata(remote_name)
+        self._validate_remote_security(remote_name)
+
+    def _validate_remote_security(self, remote_name: str) -> None:
+        details = self._remote_cards[remote_name]
+        requirements = self._remote_security_requirements(details)
+        if not requirements:
+            return
+        schemes = self._remote_security_schemes(details)
+        if not schemes:
+            raise RuntimeError(f'remote {remote_name} requires federation security but did not publish any security schemes')
+        remote = self._remote(remote_name)
+        for requirement in requirements:
+            if self._security_requirement_satisfied(remote, schemes, requirement):
+                return
+        raise RuntimeError(f'remote {remote_name} requires unsupported federation auth; inspect the published securitySchemes/security metadata first')
+
+    @staticmethod
+    def _remote_security_schemes(details: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        merged: dict[str, dict[str, Any]] = {}
+        for card_key in ('card', 'extended_card'):
+            payload = cast(dict[str, Any], details.get(card_key, {}))
+            for key in ('securitySchemes', 'security_schemes'):
+                published = payload.get(key)
+                if isinstance(published, dict):
+                    for name, scheme in published.items():
+                        if isinstance(name, str) and isinstance(scheme, dict):
+                            merged[name] = dict(cast(dict[str, Any], scheme))
+        return merged
+
+    @staticmethod
+    def _remote_security_requirements(details: dict[str, Any]) -> list[dict[str, list[str]]]:
+        for card_key in ('card', 'extended_card'):
+            payload = cast(dict[str, Any], details.get(card_key, {}))
+            published = payload.get('security')
+            if isinstance(published, dict):
+                return [
+                    {
+                        str(name): [str(item) for item in value] if isinstance(value, list) else []
+                        for name, value in published.items()
+                    }
+                ]
+            if isinstance(published, list):
+                requirements: list[dict[str, list[str]]] = []
+                for item in published:
+                    if not isinstance(item, dict):
+                        continue
+                    requirements.append(
+                        {
+                            str(name): [str(scope) for scope in value] if isinstance(value, list) else []
+                            for name, value in item.items()
+                        }
+                    )
+                if requirements:
+                    return requirements
+        return []
+
+    def _security_requirement_satisfied(
+        self,
+        remote: FederationRemoteConfig,
+        schemes: dict[str, dict[str, Any]],
+        requirement: dict[str, list[str]],
+    ) -> bool:
+        for scheme_name in requirement:
+            scheme = schemes.get(scheme_name)
+            if scheme is None or not self._supports_security_scheme(remote, scheme):
+                return False
+        return True
+
+    @staticmethod
+    def _supports_security_scheme(remote: FederationRemoteConfig, scheme: dict[str, Any]) -> bool:
+        scheme_type = str(scheme.get('type') or '').strip()
+        auth = remote.auth
+        if scheme_type == 'noAuth':
+            return auth.type is FederationAuthType.NONE
+        if scheme_type == 'mutualTLS':
+            return auth.mtls.enabled
+        if scheme_type == 'http' and str(scheme.get('scheme') or '').strip().lower() == 'bearer':
+            return auth.type in {FederationAuthType.BEARER_ENV, FederationAuthType.OAUTH, FederationAuthType.OIDC} and bool(
+                auth.token_env or auth.header_env
+            )
+        if scheme_type == 'apiKey' and str(scheme.get('in') or '').strip().lower() == 'header':
+            expected_header = str(scheme.get('name') or auth.header_name)
+            return auth.type in {FederationAuthType.HEADER_ENV, FederationAuthType.BEARER_ENV} and auth.header_name == expected_header and bool(
+                auth.header_env or auth.token_env
+            )
+        if scheme_type in {'oauth2', 'openIdConnect'}:
+            if auth.type not in {FederationAuthType.OAUTH, FederationAuthType.OIDC}:
+                return False
+            if not (auth.token_env or auth.header_env):
+                return False
+            audience = str(scheme.get('x-audience') or '').strip()
+            return not audience or not auth.oauth.audience or auth.oauth.audience == audience
+        return False
+
     @staticmethod
     def _build_headers(remote: FederationRemoteConfig) -> dict[str, str]:
         headers = dict(remote.headers)
         auth = remote.auth
-        if auth.type.value == 'bearer_env' and auth.token_env:
+        if auth.type in {FederationAuthType.BEARER_ENV, FederationAuthType.OAUTH, FederationAuthType.OIDC} and auth.token_env:
             token = os.environ.get(auth.token_env, '').strip()
             if token:
                 headers[auth.header_name] = f'{auth.value_prefix}{token}'
-        if auth.type.value == 'header_env' and auth.header_env:
+        if auth.type in {FederationAuthType.HEADER_ENV, FederationAuthType.OAUTH, FederationAuthType.OIDC} and auth.header_env:
             raw = os.environ.get(auth.header_env, '').strip()
             if raw:
                 headers[auth.header_name] = raw
@@ -658,6 +850,9 @@ class FederationServer:
         origin = _site_origin(public_url)
         exports = []
         for item in self.config.exports:
+            default_input_modes = item.default_input_modes or item.input_modes
+            default_output_modes = item.default_output_modes or item.output_modes
+            notification_compatibility = self._notification_compatibility(item)
             exports.append(
                 {
                     'name': item.name,
@@ -666,10 +861,24 @@ class FederationServer:
                     'tags': item.tags,
                     'input_modes': item.input_modes,
                     'output_modes': item.output_modes,
+                    'inputModes': item.input_modes,
+                    'outputModes': item.output_modes,
+                    'default_input_modes': default_input_modes,
+                    'default_output_modes': default_output_modes,
+                    'defaultInputModes': default_input_modes,
+                    'defaultOutputModes': default_output_modes,
                     'modalities': item.modalities,
+                    'artifacts': item.artifacts,
+                    'parts': item.parts,
+                    'notification_compatibility': notification_compatibility,
+                    'notificationCompatibility': notification_compatibility,
                     'capabilities': self._export_capabilities(item),
                 }
             )
+        security_schemes = self._security_schemes_payload()
+        security_requirements = [dict(item) for item in self.config.server.security_requirements]
+        auth_hints = self._auth_hints_payload()
+        notification_compatibility = self._notification_compatibility()
         return {
             'name': 'easy-agent-federation',
             'description': 'A2A-style export surface for local easy-agent targets.',
@@ -683,6 +892,8 @@ class FederationServer:
             'card_schema_version': self.config.server.card_schema_version,
             'default_input_modes': ['text'],
             'default_output_modes': ['text'],
+            'defaultInputModes': ['text'],
+            'defaultOutputModes': ['text'],
             'push_delivery': {
                 'polling': True,
                 'webhook_subscribe': True,
@@ -696,13 +907,12 @@ class FederationServer:
                 'resubscribe': True,
                 'push_notification_config': True,
             },
-            'auth_hints': [
-                {
-                    'type': 'none',
-                    'header_name': 'Authorization',
-                    'note': 'Server-side auth enforcement is not configured by default in easy-agent federation.',
-                }
-            ],
+            'auth_hints': auth_hints,
+            'securitySchemes': security_schemes,
+            'security_schemes': security_schemes,
+            'security': security_requirements,
+            'notification_compatibility': notification_compatibility,
+            'notificationCompatibility': notification_compatibility,
             'compatibility': {
                 'runtime': 'easy-agent',
                 'runtime_version': runtime_version(),
@@ -730,6 +940,11 @@ class FederationServer:
                     'webhook_subscribe': True,
                     'sse_events': True,
                 },
+                'pagination': {
+                    'pageToken': True,
+                    'pageSize': True,
+                    'nextPageToken': True,
+                },
             },
             'subscribe_policy': {
                 'lease_seconds_default': self.config.server.subscription_lease_seconds,
@@ -744,6 +959,8 @@ class FederationServer:
             'endpoints': {
                 'message_send': _join_url(self.public_base_url(), '/message:send'),
                 'message_stream': _join_url(self.public_base_url(), '/message:stream'),
+                'list_tasks': _join_url(self.public_base_url(), '/tasks'),
+                'list_task_events': _join_url(self.public_base_url(), '/tasks/{task_id}/events'),
                 'send_subscribe': _join_url(self.public_base_url(), '/tasks/sendSubscribe'),
                 'resubscribe': _join_url(self.public_base_url(), '/tasks/resubscribe'),
                 'push_notification_configs': _join_url(self.public_base_url(), '/tasks/{task_id}/pushNotificationConfigs'),
@@ -802,7 +1019,12 @@ class FederationServer:
                     self._write(server.extended_agent_card())
                     return
                 if path == f'{base}/tasks':
-                    self._write({'tasks': server.list_tasks()})
+                    try:
+                        page_token = str(query.get('pageToken', [''])[0] or '').strip() or None
+                        page_size = int(query.get('pageSize', ['0'])[0]) if query.get('pageSize') else None
+                        self._write(_paginate_tasks_payload(server.list_tasks(), page_token, page_size))
+                    except ValueError as exc:
+                        self._write({'error': 'invalid_page_token', 'detail': str(exc)}, status=400)
                     return
                 if path.endswith('/events/stream') and path.startswith(f'{base}/tasks/'):
                     task_id = path.split('/')[-3]
@@ -825,8 +1047,13 @@ class FederationServer:
                     return
                 if path.endswith('/events') and path.startswith(f'{base}/tasks/'):
                     task_id = path.split('/')[-2]
-                    after_sequence = int(query.get('after_sequence', ['0'])[0])
-                    self._write({'events': server.list_task_events(task_id, after_sequence)})
+                    try:
+                        page_token = str(query.get('pageToken', [''])[0] or '').strip() or None
+                        page_size = int(query.get('pageSize', ['0'])[0]) if query.get('pageSize') else None
+                        after_sequence = 0 if page_token else int(query.get('after_sequence', ['0'])[0])
+                        self._write(_paginate_events_payload(server.list_task_events(task_id, after_sequence), page_token, page_size))
+                    except ValueError as exc:
+                        self._write({'error': 'invalid_page_token', 'detail': str(exc)}, status=400)
                     return
                 if path.endswith('/subscriptions') and path.startswith(f'{base}/tasks/'):
                     task_id = path.split('/')[-2]
@@ -1028,6 +1255,9 @@ class FederationServer:
             'legacy_well_known_url': _join_url(_site_origin(self.public_base_url()), self.config.server.legacy_well_known_path),
             'version': runtime_version(),
             'push_delivery': ['polling', 'webhook_subscribe', 'sse_events'],
+            'security_schemes': list(self._security_schemes_payload()),
+            'security_requirements': [dict(item) for item in self.config.server.security_requirements],
+            'notification_compatibility': self._notification_compatibility(),
         }
 
     def stop(self) -> None:
@@ -1131,6 +1361,7 @@ class FederationServer:
     ) -> dict[str, Any]:
         if not callback_url:
             raise RuntimeError('callback_url is required for webhook subscriptions')
+        validate_callback_url(callback_url, self.config.server.push_security)
         subscription_id = uuid.uuid4().hex
         lease = lease_seconds or self.config.server.subscription_lease_seconds
         lease_expires_at = (datetime.now(UTC) + timedelta(seconds=lease)).isoformat()
@@ -1368,13 +1599,13 @@ class FederationServer:
         )
         return self.store.load_federated_subscription(str(subscription['subscription_id']))
 
-    @staticmethod
-    def _deliver_subscription_event(callback_url: str, payload: dict[str, Any]) -> None:
+    def _deliver_subscription_event(self, callback_url: str, payload: dict[str, Any]) -> None:
         encoded = json.dumps(payload, ensure_ascii=False).encode()
+        headers = build_callback_headers(callback_url, encoded, self.config.server.push_security)
         request = urllib_request.Request(
             callback_url,
             data=encoded,
-            headers={'Content-Type': 'application/json; charset=utf-8'},
+            headers=headers,
             method='POST',
         )
         with urllib_request.urlopen(request, timeout=10) as response:
@@ -1424,4 +1655,43 @@ class FederationServer:
         capabilities.setdefault('modalities', item.modalities)
         capabilities.setdefault('streaming', 'streaming' in item.capabilities)
         capabilities.setdefault('interrupts', 'interrupts' in item.capabilities)
+        capabilities.setdefault('artifacts', bool(item.artifacts))
+        capabilities.setdefault('parts', bool(item.parts))
         return capabilities
+
+    def _security_schemes_payload(self) -> dict[str, Any]:
+        return {item.name: build_security_scheme_payload(item) for item in self.config.server.security_schemes}
+
+    def _auth_hints_payload(self) -> list[dict[str, Any]]:
+        hints = [build_auth_hint_payload(item) for item in self.config.server.security_schemes]
+        if hints:
+            return hints
+        return [
+            {
+                'type': 'none',
+                'header_name': 'Authorization',
+                'note': 'Server-side auth enforcement is not configured by default in easy-agent federation.',
+            }
+        ]
+
+    def _notification_compatibility(self, export: FederationExportConfig | None = None) -> dict[str, Any]:
+        push_security = self.config.server.push_security
+        payload: dict[str, Any] = {
+            'pushNotificationConfig': True,
+            'supportsPushNotificationConfig': True,
+            'delivery': ['polling', 'webhook_subscribe', 'sse_events'],
+            'callbackUrlPolicy': push_security.callback_url_policy,
+            'auth': {
+                'tokenHeader': push_security.token_header,
+                'signatureHeader': push_security.signature_header,
+                'timestampHeader': push_security.timestamp_header,
+                'audienceHeader': push_security.audience_header,
+                'requiresSignature': push_security.require_signature,
+                'requiresAudience': push_security.require_audience,
+            },
+        }
+        if push_security.audience:
+            payload['auth']['audience'] = push_security.audience
+        if export is not None and export.notification_compatibility:
+            payload.update(export.notification_compatibility)
+        return payload
