@@ -125,8 +125,8 @@ async def test_federation_loopback_server_and_client(tmp_path: Path) -> None:
     )
     await manager.start()
     try:
-        remote = await manager.inspect_remote('loopback')
         result = await manager.run_remote('loopback', 'local_echo', 'hello', session_id='demo-session')
+        remote = await manager.inspect_remote('loopback')
         stream_events = await manager.stream_remote('loopback', 'local_echo', 'streamed')
         tasks = await manager.list_tasks('loopback')
         task_id = str(tasks[-1]['task_id'])

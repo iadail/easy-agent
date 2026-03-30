@@ -17,6 +17,10 @@ graph:
       system_prompt: |
         You are the coordinator agent. Use available tools or delegate to sub-agents.
       tools:
+        - github_issue_list
+        - github_issue_prepare_fix
+        - git_commit_local
+        - github_release_publish
         - python_echo
         - command_echo
       sub_agents:
@@ -45,6 +49,8 @@ harnesses:
 plugins: []
 
 skills:
+  - path: .easy-agent/local-skills/github_automation
+    optional: true
   - path: skills/examples
 
 mcp: []

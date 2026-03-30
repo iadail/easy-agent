@@ -3,12 +3,14 @@ import httpx
 from agent_config.app import AppConfig
 from agent_runtime.public_eval import (
     _build_tool_name_map,
+    _extract_tau_tasks_from_history,
     _is_retryable_provider_400,
     _normalize_schema,
     _score_bfcl_case,
     _score_tau_case,
     _select_bfcl_candidate_functions,
     _strict_normalize_schema,
+    _tau_history_memory_message,
 )
 
 
@@ -162,3 +164,28 @@ def test_retryable_provider_400_checks_openai_compatible_provider() -> None:
     assert _is_retryable_provider_400(deepseek_config, exc) is True
     assert _is_retryable_provider_400(anthropic_config, exc) is False
 
+
+def test_extract_tau_tasks_from_history_reads_tool_payloads() -> None:
+    history = [
+        {'role': 'user', 'content': 'create a task'},
+        {
+            'role': 'tool',
+            'content': '{"task_id":"task_2","title":"Project Review","description":"Review Q4","status":"pending"}',
+        },
+    ]
+
+    tasks = _extract_tau_tasks_from_history(history)
+
+    assert tasks['task_2']['title'] == 'Project Review'
+    assert tasks['task_2']['status'] == 'pending'
+
+
+
+def test_tau_history_memory_message_summarizes_known_tasks() -> None:
+    message = _tau_history_memory_message(
+        {'task_2': {'task_id': 'task_2', 'title': 'Project Review', 'description': 'Review Q4', 'status': 'pending'}}
+    )
+
+    assert message is not None
+    assert 'task_2' in message
+    assert 'Project Review' in message

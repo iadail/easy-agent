@@ -28,14 +28,18 @@ class InlineRuntimePlugin:
     def __init__(
         self,
         skill_paths: list[Path] | None = None,
+        optional_skill_paths: list[Path] | None = None,
         mcp_servers: list[McpServerConfig] | None = None,
     ) -> None:
         self.skill_paths = skill_paths or []
+        self.optional_skill_paths = optional_skill_paths or []
         self.mcp_servers = mcp_servers or []
 
     def register(self, host: RuntimePluginHost) -> None:
         for skill_path in self.skill_paths:
-            host.register_skill_path(skill_path)
+            host.register_skill_path(skill_path, optional=False)
+        for skill_path in self.optional_skill_paths:
+            host.register_skill_path(skill_path, optional=True)
         for server in self.mcp_servers:
             host.register_mcp_server(server)
 
@@ -57,8 +61,8 @@ class RuntimePluginHost:
         plugin.register(self)
         return self._describe_source(source)
 
-    def register_skill_path(self, path: Path) -> None:
-        self.runtime.register_skill_path(path)
+    def register_skill_path(self, path: Path, optional: bool = False) -> None:
+        self.runtime.register_skill_path(path, optional=optional)
 
     def register_mcp_server(self, config: McpServerConfig) -> None:
         self.runtime.register_mcp_server(config)

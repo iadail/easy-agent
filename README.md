@@ -309,6 +309,15 @@ uv run easy-agent mcp roots list filesystem -c configs/longrun.example.yml
 uv run easy-agent mcp auth status filesystem -c configs/longrun.example.yml
 ```
 
+### Local GitHub Automation Skill Pack
+
+The default `easy-agent.yml` now reserves an optional local-only skill root at `.easy-agent/local-skills/github_automation`.
+
+- When that local skill pack exists, the coordinator starts with `github_issue_list`, `github_issue_prepare_fix`, `git_commit_local`, and `github_release_publish` ahead of the generic demo tools.
+- The pack is intentionally untracked so repo-specific delivery automation can stay private to one checkout.
+- `github_issue_prepare_fix` prepares a branch plus a task package under `.easy-agent/github-automation/issues/<number>/` instead of silently editing code.
+- Install GitHub CLI first and authenticate it locally before using those skills: `gh --version` and `gh auth login`.
+
 ### Python Runtime Example
 
 ```python
@@ -350,7 +359,7 @@ Python CLI smoke is also verified through `CliRunner` against `agent_cli.app:app
 
 Snapshot date: March 30, 2026.
 
-This snapshot combines fresh Python verification and a fresh live public-eval refresh from March 30, 2026 with the retained real-network matrix from March 29, 2026 and the retained benchmark artifact from March 27, 2026. The March 30 verification used Python `3.12.11`, local `.env.local` credentials, live DeepSeek calls, and the repository's real MCP-backed integration suite.
+This snapshot combines fresh static checks, a fresh focused real-network pytest pass, and a repo-local Python manual verification pass from March 30, 2026. The real-network matrix below was regenerated on March 30, 2026, while the benchmark artifact remains the retained March 27, 2026 snapshot and the public-eval artifact remains the retained March 30, 2026 live snapshot.
 
 ### Python Verification Snapshot
 
@@ -358,26 +367,31 @@ This snapshot combines fresh Python verification and a fresh live public-eval re
 | --- | --- | --- |
 | Static checks | `.\.venv\Scripts\python.exe -m ruff check src tests scripts` | passed |
 | Typing | `.\.venv\Scripts\python.exe -m mypy src tests scripts` | passed |
-| Unit tests | `.\.venv\Scripts\python.exe -m pytest tests/unit -q --basetemp=%TEMP%\easy-agent-pytest\unit-full-<timestamp>` | `83 passed` |
-| Real integration tests | `.\.venv\Scripts\python.exe -m pytest tests/integration -m real -q --basetemp=%TEMP%\easy-agent-pytest\integration-full-<timestamp>` | `5 passed` |
-| Live benchmark artifact | `.easy-agent/benchmark-report.json` | existing March 27, 2026 snapshot reused |
-| Live public-eval refresh | Python helper calling `run_public_eval_suite('easy-agent.yml')` | report refreshed with `overall.bfcl_pass_rate = 0.8750` |
-| Live real-network artifact | `.easy-agent/real-network-report.json` | existing March 29, 2026 snapshot reused |
-| Python CLI coverage | `CliRunner`-based CLI tests inside the full unit suite | covered by the current `83 passed` run |
+| Focused real-network pytest | `.\.venv\Scripts\python.exe -m pytest tests/integration/test_real_network_eval.py -m real -q` | `1 passed` |
+| Targeted manual Python verification | repo-local script writing `.easy-agent/manual-verify/20260330-github-fed/manual-verification-report.json` | passed |
+| Live real-network artifact | `.easy-agent/real-network-report.json` | refreshed on March 30, 2026 |
+| Live benchmark artifact | `.easy-agent/benchmark-report.json` | retained March 27, 2026 snapshot |
+| Live public-eval artifact | `.easy-agent/public-eval-report.json` | retained March 30, 2026 snapshot |
+
+The manual Python verification pass covered the new GitHub automation helpers, optional local skill loading, duplicate-call suppression for optional-only argument supersets, tau history grounding helpers, and federation auto-discovery before `run_remote()`.
 
 ### Real Network Matrix
 
 | Scenario | Transport | Status | Duration (s) | Notes |
 | --- | --- | --- | --- | --- |
-| `cross_process_federation` | `http_poll` | passed | `1.4692` | cross-process well-known discovery and send/poll federation passed |
-| `disconnect_retry_chaos` | `http_webhook` | passed | `4.1902` | callback retry, `pushNotificationConfig`, `sendSubscribe`, and resubscribe passed |
-| `workbench_reuse_process` | `local_process` | passed | `1.5789` | process workbench reused the same long-lived session root |
-| `workbench_reuse_container` | `podman_exec` | passed | `29.6954` | container executor loaded an offline image archive, enforced quotas, and resumed from a snapshot image |
-| `workbench_reuse_microvm` | `podman_machine_ssh` | passed | `19.1149` | microvm executor reused the podman machine over SSH and recovered after a disconnect-style restart |
-| `replay_resume_failure_injection` | `sqlite_checkpoint` | passed | `5.6087` | resume, replay, and fork recovery passed under injected failure |
+| `cross_process_federation` | `http_poll` | passed | `0.7481` | cross-process well-known discovery and send/poll federation passed |
+| `live_model_federation_roundtrip` | `http_poll` | skipped | `6.9997` | live-model loopback path reached the new row, but the provider connection failed in this session before the remote agent could answer |
+| `disconnect_retry_chaos` | `http_webhook` | passed | `4.1800` | callback retry, `pushNotificationConfig`, `sendSubscribe`, and resubscribe passed |
+| `duplicate_delivery_replay_resilience` | `http_webhook` | passed | `3.6405` | duplicate delivery and replay reads preserved a stable federated task event log |
+| `workbench_reuse_process` | `local_process` | passed | `2.3959` | process workbench reused the same long-lived session root |
+| `workbench_reuse_container` | `podman_exec` | skipped | `3.4967` | host Podman credentials were not readable in this session |
+| `workbench_incremental_snapshot_reuse_container` | `podman_exec` | skipped | `3.4215` | host Podman credentials were not readable in this session |
+| `workbench_reuse_microvm` | `podman_machine_ssh` | skipped | `0.1807` | podman-machine lock or identity paths were denied on this host |
+| `workbench_incremental_snapshot_reuse_microvm` | `podman_machine_ssh` | skipped | `0.1905` | podman-machine lock or identity paths were denied on this host |
+| `replay_resume_failure_injection` | `sqlite_checkpoint` | passed | `9.0014` | resume, replay, and fork recovery passed under injected failure |
 
-Summary: `6 passed`, `0 failed`, `0 skipped`.
-Source: `.easy-agent/real-network-report.json` generated at `2026-03-29T15:05:37Z`.
+Summary: `5 passed`, `0 failed`, `5 skipped`.
+Source: `.easy-agent/real-network-report.json` generated at `2026-03-30T07:29:01Z`.
 
 ### Live Benchmark Snapshot
 
@@ -401,27 +415,27 @@ Source: latest checked `.easy-agent/benchmark-report.json` artifact retained fro
 | `bfcl_parallel_multiple` | `0.7500` | 3 of 4 cases passed |
 | `bfcl_irrelevance` | `1.0000` | 4 of 4 cases passed |
 | `tau2_mock` | `0.6667` | 2 of 3 cases passed |
-| `overall.bfcl_pass_rate` | `0.8750` | provider-aware fallback recovered the prior OpenAI-compatible schema failures; remaining misses are behavior-level over-calls rather than provider `400`s |
+| `overall.bfcl_pass_rate` | `0.8750` | provider-aware fallback recovered the prior OpenAI-compatible schema failures; the remaining misses are behavior-level over-calls rather than provider `400`s |
 
-Source: `.easy-agent/public-eval-report.json` refreshed on March 30, 2026.
+Source: `.easy-agent/public-eval-report.json` retained from the March 30, 2026 live refresh.
 
 Current caveats:
 
-- The live suite still emits Windows `asyncio` subprocess cleanup warnings after completion, but the integration tests and report refresh completed successfully.
-- The remaining BFCL misses are now behavior-level duplicate or over-eager tool calls (`simple_5`, `multiple_7`, and `parallel_multiple_3`) rather than provider-side schema rejection.
-- The remaining tau2 miss is the history-heavy `update_task_with_message_history` case; the model still asks a follow-up instead of grounding to the prior tool result.
-- The public-eval report now records `fallback_stage` and `fallback_attempts` so provider-compatible degradation paths stay inspectable during future regression triage.
+- The current Windows sandbox session still blocks pytest-managed temp roots for many `tmp_path`-heavy unit cases, so this round used repo-local Python verification to cover the changed unit surfaces directly.
+- The new live-model federation row is now present and exercised, but the provider connection failed in this session, so the row landed as `skipped` rather than `passed`.
+- Container and microVM snapshot rows are present and exercised, but host Podman or machine credentials were denied on this machine, so those rows remain `skipped`.
+- The retained public-eval snapshot is still the latest live scorecard; this round's public-eval changes were validated through targeted Python helper coverage rather than a fresh external-network refresh.
 
 ## Next Reinforcement
 
 These next steps are based on the current public A2A and MCP protocol surfaces, not just internal backlog notes.
 
-- Push federation card and task negotiation closer to the latest public A2A surface by adding richer artifact or part-level modality declarations, `ListTasks` cursor pagination (`pageToken` / `nextPageToken`), and clearer notification compatibility metadata.
+- Push federation card and task negotiation closer to the latest public A2A surface by adding richer artifact or part-level modality declarations, `ListTasks` or `ListTaskEvents` cursor pagination (`pageToken` / `nextPageToken`), and clearer notification compatibility metadata around push delivery.
 - Harden federation security toward production-grade remote trust with stronger auth scheme hints, signed callback verification, OAuth or OIDC flows, callback audience validation, and optional mTLS between agent servers.
-- Expand MCP capability negotiation from basic roots support to full `roots/list_changed` flows plus stronger `streamable_http` reconnect, auth-refresh, and server-initiated lifecycle handling.
-- Extend MCP sampling beyond the current text-first bridge so safe low-risk requests can preserve richer content blocks when the provider and runtime support them, while high-risk requests remain deferred behind human approval.
-- Add stage-aware public-eval analytics, per-provider schema compatibility matrices, and stronger regression fixtures for duplicate-call suppression plus history-grounding cases.
-- Extend the real-network suite with mixed live-model federation runs, duplicate-delivery or replay resilience checks, and faster delta-based container or microVM snapshot reuse on repeat executions.
+- Expand MCP capability negotiation from the current roots support to full `roots/list_changed` flows plus stronger `streamable_http` reconnect, auth-refresh, and server-initiated lifecycle handling.
+- Extend MCP sampling and elicitation beyond the current text-first bridge so low-risk requests can preserve richer structured content blocks or form payloads when the provider and runtime support them, while high-risk remote requests remain deferred behind human approval.
+- Add stage-aware public-eval analytics, per-provider schema compatibility matrices, and stronger regression fixtures for duplicate-call suppression, history-grounding, and OpenAI-compatible fallback paths.
+- Turn the newly added real-network rows from `skipped` into stable `passed` coverage on provisioned hosts by preflighting live-model connectivity, Podman identity access, and container or microVM delta-snapshot warm caches.
 
 ## Design References
 

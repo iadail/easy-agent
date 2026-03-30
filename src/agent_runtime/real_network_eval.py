@@ -21,6 +21,7 @@ from agent_config.app import (
     ContainerExecutorOptions,
     ExecutorConfig,
     MicrovmExecutorOptions,
+    load_config,
 )
 from agent_integrations.executors import build_executor_backends
 from agent_integrations.federation import FederationClientManager, FederationServer
@@ -344,6 +345,75 @@ def _scenario_cross_process_federation() -> str:
         process.wait(timeout=5)
 
 
+
+def _scenario_live_model_federation_roundtrip(base_config: AppConfig, tmp_path: Path) -> str:
+    api_key = os.environ.get(base_config.model.api_key_env, '').strip()
+    if not api_key:
+        raise RuntimeError(f'skipped: missing {base_config.model.api_key_env}')
+    config = AppConfig.model_validate(
+        {
+            'model': base_config.model.model_dump(),
+            'graph': {
+                'entrypoint': 'responder',
+                'agents': [
+                    {
+                        'name': 'responder',
+                        'description': 'Loopback live-model responder.',
+                        'system_prompt': 'Reply with exactly FEDERATED_OK and no other text.',
+                        'tools': [],
+                        'sub_agents': [],
+                        'max_iterations': 2,
+                    }
+                ],
+                'teams': [],
+                'nodes': [],
+            },
+            'federation': {
+                'server': {'enabled': True, 'host': '127.0.0.1', 'port': 0, 'base_path': '/a2a'},
+                'exports': [
+                    {
+                        'name': 'live_model_agent',
+                        'target_type': 'agent',
+                        'target': 'responder',
+                        'description': 'Live model federation responder',
+                        'modalities': ['text'],
+                        'capabilities': ['streaming'],
+                    }
+                ],
+            },
+            'storage': {'path': str(tmp_path / 'state'), 'database': 'state.db'},
+        }
+    )
+    config.model.temperature = 0.0
+    config.model.max_tokens = min(config.model.max_tokens, 64)
+    runtime = build_runtime_from_config(config)
+
+    async def _run_async() -> str:
+        await runtime.start()
+        status = runtime.serve_federation()
+        manager = FederationClientManager(
+            AppConfig.model_validate(
+                {
+                    'graph': {'entrypoint': 'noop', 'agents': [{'name': 'noop'}], 'teams': [], 'nodes': []},
+                    'federation': {'remotes': [{'name': 'loopback', 'base_url': str(status['public_base_url'])}]},
+                }
+            ).federation,
+            store=runtime.store,
+        )
+        await manager.start()
+        try:
+            result = await manager.run_remote('loopback', 'live_model_agent', 'Return the exact token only.')
+        finally:
+            await manager.aclose()
+            await runtime.aclose()
+        response_text = str(result.get('result') or '').strip().upper()
+        if 'FEDERATED_OK' not in response_text:
+            raise AssertionError(f'unexpected live-model federated response: {result}')
+        return 'live-model loopback federation completed through the local A2A surface'
+
+    return asyncio.run(_run_async())
+
+
 def _scenario_federation_retry_and_reconnect(tmp_path: Path) -> str:
     runtime = _FakeRuntime(tmp_path)
     server = FederationServer(runtime)
@@ -519,6 +589,192 @@ def _scenario_microvm_workbench_reuse(tmp_path: Path) -> str:
     return 'microvm executor reused the podman machine over SSH and recovered after a disconnect-style restart'
 
 
+
+def _scenario_duplicate_delivery_replay_resilience(tmp_path: Path) -> str:
+    runtime = _FakeRuntime(tmp_path)
+    server = FederationServer(runtime)
+    callback = _CallbackCollector()
+    callback_url = callback.start()
+    status = server.start()
+    base_url = f"http://127.0.0.1:{status['port']}"
+
+    async def _run_async() -> str:
+        manager = FederationClientManager(
+            AppConfig.model_validate(
+                {
+                    'graph': {'entrypoint': 'noop', 'agents': [{'name': 'noop'}], 'teams': [], 'nodes': []},
+                    'federation': {'remotes': [{'name': 'loopback', 'base_url': base_url}]},
+                }
+            ).federation,
+            store=runtime.store,
+        )
+        await manager.start()
+        try:
+            response = await manager.send_subscribe('loopback', 'local_echo', 'stable-delivery', callback_url, from_sequence=0)
+            task_id = str(response['task']['task_id'])
+            deadline = time.monotonic() + 5.0
+            task_payload: dict[str, Any] | None = None
+            while time.monotonic() < deadline:
+                task_payload = await manager.get_task('loopback', task_id)
+                if task_payload['status'] == 'succeeded':
+                    break
+                await asyncio.sleep(0.1)
+            if task_payload is None or task_payload['status'] != 'succeeded':
+                raise AssertionError('task did not reach a terminal state')
+            events_before = await manager.list_task_events('loopback', task_id, after_sequence=0)
+            replay_full = await manager.resubscribe_task('loopback', task_id, from_sequence=0)
+            replay_tail = await manager.resubscribe_task('loopback', task_id, from_sequence=1)
+            events_after = await manager.list_task_events('loopback', task_id, after_sequence=0)
+            sequences_before = [int(item['sequence']) for item in events_before]
+            if sequences_before != sorted(set(sequences_before)):
+                raise AssertionError('event sequences are not unique and ordered')
+            if [int(item['sequence']) for item in replay_full['events']] != sequences_before:
+                raise AssertionError('full replay did not preserve the event backlog')
+            if any(int(item['sequence']) <= 1 for item in replay_tail['events']):
+                raise AssertionError('tail replay returned duplicate early events')
+            if len(events_before) != len(events_after):
+                raise AssertionError('replay mutated the persisted task event log')
+            if callback.deliveries[-1]['events'][-1]['event_kind'] != 'task_succeeded':
+                raise AssertionError('callback delivery did not capture the terminal event')
+            return 'duplicate delivery and replay reads preserved a stable federated task event log'
+        finally:
+            await manager.aclose()
+
+    try:
+        return asyncio.run(_run_async())
+    finally:
+        callback.stop()
+        server.stop()
+
+
+
+def _scenario_container_incremental_snapshot_reuse(tmp_path: Path) -> str:
+    podman_executable = os.environ.get('EASY_AGENT_PODMAN_EXE', 'podman')
+    archive = _ensure_offline_container_archive(Path('.easy-agent/offline-images'), podman_executable)
+    image = os.environ.get('EASY_AGENT_CONTAINER_IMAGE', 'localhost/easy-agent/offline-python:latest')
+    manager = _workbench_manager(
+        tmp_path,
+        [
+            ExecutorConfig(
+                name='containerized',
+                kind='container',
+                default_timeout_seconds=120,
+                container=ContainerExecutorOptions(
+                    executable=podman_executable,
+                    image=image,
+                    image_archive=str(archive),
+                    keepalive_command=['python3', '-c', 'import time; time.sleep(10**9)'],
+                    auto_load=True,
+                    auto_build=False,
+                    checkpoint_enabled=True,
+                    memory_mb=512,
+                    cpus=1.0,
+                ),
+            )
+        ],
+        'containerized',
+    )
+    session = manager.ensure_session('run-container-delta', 'skill-echo')
+    first_start = time.perf_counter()
+    warm_one = manager.run_command(
+        session.session_id,
+        ['python3', '-c', "from pathlib import Path; Path('step1.txt').write_text('one', encoding='utf-8'); print('step1')"],
+        env={},
+        timeout_seconds=120,
+        target=SandboxTarget.COMMAND_SKILL,
+    )
+    first_duration = time.perf_counter() - first_start
+    if warm_one.returncode != 0:
+        raise AssertionError(warm_one.stderr or warm_one.stdout)
+    manager.shutdown_session(session.session_id)
+    restart_one = manager.restart_session(session.session_id)
+    second_start = time.perf_counter()
+    warm_two = manager.run_command(
+        restart_one.session_id,
+        ['python3', '-c', "from pathlib import Path; Path('step2.txt').write_text(Path('step1.txt').read_text(encoding='utf-8') + '-two', encoding='utf-8'); print(Path('step2.txt').read_text(encoding='utf-8'))"],
+        env={},
+        timeout_seconds=120,
+        target=SandboxTarget.COMMAND_SKILL,
+    )
+    second_duration = time.perf_counter() - second_start
+    if warm_two.returncode != 0 or 'one-two' not in warm_two.stdout:
+        raise AssertionError(warm_two.stderr or warm_two.stdout)
+    manager.shutdown_session(session.session_id)
+    restart_two = manager.restart_session(session.session_id)
+    verify = manager.run_command(
+        restart_two.session_id,
+        ['python3', '-c', "from pathlib import Path; print(Path('step2.txt').read_text(encoding='utf-8'))"],
+        env={},
+        timeout_seconds=120,
+        target=SandboxTarget.COMMAND_SKILL,
+    )
+    if verify.returncode != 0 or 'one-two' not in verify.stdout:
+        raise AssertionError(verify.stderr or verify.stdout)
+    return (
+        'container repeated checkpoint restore preserved incremental state '
+        f'(first_cycle={first_duration:.3f}s, second_cycle={second_duration:.3f}s)'
+    )
+
+
+
+def _scenario_microvm_incremental_snapshot_reuse(tmp_path: Path) -> str:
+    podman_executable = os.environ.get('EASY_AGENT_PODMAN_EXE', 'podman')
+    machine = _podman_machine_info(podman_executable)
+    manager = _workbench_manager(
+        tmp_path,
+        [
+            ExecutorConfig(
+                name='microvm-machine',
+                kind='microvm',
+                default_timeout_seconds=90,
+                microvm=MicrovmExecutorOptions(
+                    provider='podman_machine',
+                    executable=podman_executable,
+                    machine_name=machine['name'],
+                    ssh_user=machine['user'],
+                    ssh_private_key=machine['identity_path'],
+                    guest_workdir='/tmp/easy-agent-workbench',
+                    checkpoint_enabled=True,
+                ),
+            )
+        ],
+        'microvm-machine',
+    )
+    session = manager.ensure_session('run-microvm-delta', 'skill-echo')
+    first = manager.run_command(
+        session.session_id,
+        ['python3', '-c', "from pathlib import Path; Path('delta1.txt').write_text('one', encoding='utf-8'); print('delta1')"],
+        env={},
+        timeout_seconds=90,
+        target=SandboxTarget.COMMAND_SKILL,
+    )
+    if first.returncode != 0:
+        raise AssertionError(first.stderr or first.stdout)
+    manager.shutdown_session(session.session_id)
+    restart_one = manager.restart_session(session.session_id)
+    second = manager.run_command(
+        restart_one.session_id,
+        ['python3', '-c', "from pathlib import Path; Path('delta2.txt').write_text(Path('delta1.txt').read_text(encoding='utf-8') + '-two', encoding='utf-8'); print(Path('delta2.txt').read_text(encoding='utf-8'))"],
+        env={},
+        timeout_seconds=90,
+        target=SandboxTarget.COMMAND_SKILL,
+    )
+    if second.returncode != 0 or 'one-two' not in second.stdout:
+        raise AssertionError(second.stderr or second.stdout)
+    manager.shutdown_session(session.session_id)
+    restart_two = manager.restart_session(session.session_id)
+    verify = manager.run_command(
+        restart_two.session_id,
+        ['python3', '-c', "from pathlib import Path; print(Path('delta2.txt').read_text(encoding='utf-8'))"],
+        env={},
+        timeout_seconds=90,
+        target=SandboxTarget.COMMAND_SKILL,
+    )
+    if verify.returncode != 0 or 'one-two' not in verify.stdout:
+        raise AssertionError(verify.stderr or verify.stdout)
+    return 'microvm repeated checkpoint restore preserved incremental state across restart cycles'
+
+
 def _scenario_replay_resume_failure_injection(tmp_path: Path) -> str:
     config = AppConfig.model_validate(
         {
@@ -580,7 +836,7 @@ def _scenario_replay_resume_failure_injection(tmp_path: Path) -> str:
 
 
 def run_real_network_suite(config_path: str | Path = 'easy-agent.yml') -> dict[str, Any]:
-    del config_path
+    base_config = load_config(config_path)
     output_root = Path('.easy-agent')
     output_root.mkdir(parents=True, exist_ok=True)
     tmp_root = output_root / 'real-network-tmp' / str(int(time.time() * 1000))
@@ -588,10 +844,14 @@ def run_real_network_suite(config_path: str | Path = 'easy-agent.yml') -> dict[s
     try:
         records = [
             _record('cross_process_federation', 'http_poll', 'python subprocess', _scenario_cross_process_federation),
+            _record('live_model_federation_roundtrip', 'http_poll', f"{base_config.model.provider} live model", lambda: _scenario_live_model_federation_roundtrip(base_config, tmp_root / 'live-model'), live_model=True),
             _record('disconnect_retry_chaos', 'http_webhook', 'loopback callback server', lambda: _scenario_federation_retry_and_reconnect(tmp_root / 'federation')),
+            _record('duplicate_delivery_replay_resilience', 'http_webhook', 'loopback callback server', lambda: _scenario_duplicate_delivery_replay_resilience(tmp_root / 'federation-replay')),
             _record('workbench_reuse_process', 'local_process', 'none', lambda: _scenario_process_workbench_reuse(tmp_root / 'process')),
             _record('workbench_reuse_container', 'podman_exec', 'podman machine rootfs import', lambda: _scenario_container_workbench_reuse(tmp_root / 'container')),
+            _record('workbench_incremental_snapshot_reuse_container', 'podman_exec', 'podman machine rootfs import', lambda: _scenario_container_incremental_snapshot_reuse(tmp_root / 'container-delta')),
             _record('workbench_reuse_microvm', 'podman_machine_ssh', 'podman machine ssh', lambda: _scenario_microvm_workbench_reuse(tmp_root / 'microvm')),
+            _record('workbench_incremental_snapshot_reuse_microvm', 'podman_machine_ssh', 'podman machine ssh', lambda: _scenario_microvm_incremental_snapshot_reuse(tmp_root / 'microvm-delta')),
             _record('replay_resume_failure_injection', 'sqlite_checkpoint', 'none', lambda: _scenario_replay_resume_failure_injection(tmp_root / 'resume')),
         ]
     finally:

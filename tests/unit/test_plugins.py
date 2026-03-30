@@ -5,7 +5,7 @@ import pytest
 
 from agent_common.models import ToolSpec
 from agent_config.app import AppConfig, ModelConfig
-from agent_integrations.plugins import FunctionRuntimePlugin, RuntimePluginHost
+from agent_integrations.plugins import FunctionRuntimePlugin, InlineRuntimePlugin, RuntimePluginHost
 from agent_runtime.runtime import build_runtime_from_config
 
 
@@ -113,7 +113,44 @@ def test_runtime_loads_entry_point_plugin(tmp_path: Path, monkeypatch: pytest.Mo
 
     assert runtime.registry.has("entry_point_tool")
 
+def test_runtime_ignores_missing_optional_skill_path(tmp_path: Path) -> None:
+    runtime = build_runtime_from_config(build_config(tmp_path))
+
+    loaded = runtime.register_skill_path(tmp_path / "missing-skill-root", optional=True)
+
+    assert loaded == []
+    assert runtime.skills == []
 
 
 
+def test_inline_plugin_loads_optional_skill_path_when_present(tmp_path: Path) -> None:
+    skill_root = tmp_path / "optional-skills"
+    skill_dir = skill_root / "optional_python_echo"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "skill.yaml").write_text(
+        dedent(
+            """
+            name: optional_python_echo
+            description: Optional skill
+            entry_type: python
+            hook: hook.py:run
+            input_schema:
+              type: object
+            """
+        ).strip(),
+        encoding="utf-8",
+    )
+    (skill_dir / "hook.py").write_text(
+        dedent(
+            """
+            def run(arguments, context):
+                return {"ok": True, "arguments": arguments, "run_id": context.run_id}
+            """
+        ).strip(),
+        encoding="utf-8",
+    )
 
+    runtime = build_runtime_from_config(build_config(tmp_path))
+    runtime.load(InlineRuntimePlugin(optional_skill_paths=[skill_root]))
+
+    assert any(skill.name == "optional_python_echo" for skill in runtime.skills)

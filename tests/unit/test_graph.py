@@ -100,6 +100,31 @@ class DuplicateToolModelClient:
         return None
 
 
+class DuplicateOptionalArgModelClient:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def complete(self, messages: list[ChatMessage], tools: list[ToolSpec]) -> AssistantResponse:
+        del messages, tools
+        self.calls += 1
+        if self.calls == 1:
+            return AssistantResponse(
+                text='',
+                tool_calls=[ToolCall(id='dup-opt-1', name='measure', arguments={'value': 10})],
+                protocol=Protocol.OPENAI,
+            )
+        if self.calls == 2:
+            return AssistantResponse(
+                text='',
+                tool_calls=[ToolCall(id='dup-opt-2', name='measure', arguments={'value': 10, 'tolerance': 0.1})],
+                protocol=Protocol.OPENAI,
+            )
+        return AssistantResponse(text='optional-deduped', protocol=Protocol.OPENAI)
+
+    async def aclose(self) -> None:
+        return None
+
+
 class DummyMcpManager:
     async def call_tool(
         self,
@@ -562,4 +587,57 @@ async def test_graph_scheduler_runs_federated_node(tmp_path: Path) -> None:
     assert result['result']['target'] == 'local_echo'
 
 
+@pytest.mark.asyncio
+async def test_graph_scheduler_blocks_duplicate_tool_calls_with_optional_argument_superset(tmp_path: Path) -> None:
+    config = AppConfig.model_validate(
+        {
+            'model': ModelConfig().model_dump(),
+            'graph': {
+                'entrypoint': 'coordinator',
+                'agents': [
+                    {
+                        'name': 'coordinator',
+                        'system_prompt': 'system',
+                        'tools': ['measure'],
+                        'sub_agents': [],
+                    }
+                ],
+                'nodes': [],
+            },
+            'skills': [],
+            'mcp': [],
+            'storage': {'path': str(tmp_path), 'database': 'state.db'},
+            'security': {'allowed_commands': []},
+        }
+    )
+    registry = ToolRegistry()
+    call_counter = {'count': 0}
 
+    def measure(arguments: dict[str, Any], context: RunContext) -> dict[str, Any]:
+        del context
+        call_counter['count'] += 1
+        return {'value': arguments['value'], 'status': 'measured'}
+
+    registry.register(
+        ToolSpec(
+            name='measure',
+            description='measure',
+            input_schema={
+                'type': 'object',
+                'properties': {'value': {'type': 'integer'}, 'tolerance': {'type': 'number'}},
+                'required': ['value'],
+            },
+        ),
+        measure,
+    )
+    store = SQLiteRunStore(tmp_path, 'state.db')
+    model_client = DuplicateOptionalArgModelClient()
+    orchestrator = AgentOrchestrator(config, model_client, registry, store, GuardrailEngine())
+    scheduler = GraphScheduler(config, registry, orchestrator, store, DummyMcpManager(), GuardrailEngine())
+
+    result = await scheduler.run('measure once')
+    trace = store.load_trace(result['run_id'])
+
+    assert result['result'] == 'optional-deduped'
+    assert call_counter['count'] == 1
+    assert any(event['kind'] == 'tool_call_duplicate_blocked' for event in trace['events'])

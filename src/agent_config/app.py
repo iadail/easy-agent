@@ -153,6 +153,7 @@ class HarnessConfig(BaseModel):
 
 class SkillSourceConfig(BaseModel):
     path: str
+    optional: bool = False
 
 
 class McpRootConfig(BaseModel):

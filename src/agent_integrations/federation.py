@@ -140,6 +140,7 @@ class FederationClientManager:
         session_id: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        await self._ensure_remote_metadata(remote_name)
         response = await self._client(remote_name).post(
             _join_url(self._base_path(remote_name), '/tasks/send'),
             json={

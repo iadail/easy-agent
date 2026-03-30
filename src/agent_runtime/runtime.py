@@ -75,10 +75,12 @@ class EasyAgentRuntime:
     def set_inline_approval_resolver(self, resolver: InlineApprovalResolver | None) -> None:
         self.human_loop.set_inline_resolver(resolver)
 
-    def register_skill_path(self, path: Path) -> list[SkillMetadata]:
+    def register_skill_path(self, path: Path, *, optional: bool = False) -> list[SkillMetadata]:
         if self._started:
             raise RuntimeError('Skills must be registered before runtime.start()')
         resolved_path = path.resolve()
+        if optional and not resolved_path.exists():
+            return []
         if resolved_path in self._loaded_skill_paths:
             return []
         loader = SkillLoader(
@@ -639,7 +641,12 @@ def build_runtime_from_config(config: AppConfig) -> EasyAgentRuntime:
     for plugin_source in config.plugins:
         runtime.load(plugin_source)
     if config.skills:
-        runtime.load(InlineRuntimePlugin(skill_paths=[Path(item.path) for item in config.skills]))
+        runtime.load(
+            InlineRuntimePlugin(
+                skill_paths=[Path(item.path) for item in config.skills if not item.optional],
+                optional_skill_paths=[Path(item.path) for item in config.skills if item.optional],
+            )
+        )
     orchestrator.register_subagent_tools()
     return runtime
 

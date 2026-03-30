@@ -12,21 +12,35 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - Added `src/agent_common/schema_utils.py` so protocol adapters, MCP integration, and public-eval all reuse the same JSON-schema normalization rules.
 - Added risk-aware MCP sampling and elicitation handling with deferred approval escalation for high-risk remote requests plus richer form / URL elicitation payload processing.
 - Added provider-aware BFCL fallback tracking in public eval with `fallback_stage`, `fallback_attempts`, and candidate-pruned retry paths for OpenAI-compatible `400` responses.
+- Added `src/agent_integrations/github_automation.py` with local GitHub automation helpers for:
+  - `github_issue_list`
+  - `github_issue_prepare_fix`
+  - `git_commit_local`
+  - `github_release_publish`
+- Added optional local skill-path loading so `.easy-agent/local-skills/github_automation` can stay untracked while still mounting repo-specific automation when present.
+- Extended the real-network suite with:
+  - `live_model_federation_roundtrip`
+  - `duplicate_delivery_replay_resilience`
+  - `workbench_incremental_snapshot_reuse_container`
+  - `workbench_incremental_snapshot_reuse_microvm`
 
 ### Changed
 
 - Switched OpenAI-compatible tool-schema sanitization to the shared schema normalizer and tightened BFCL schema coercion for complex function definitions.
 - Updated the inline CLI approval resolver so MCP form elicitation responses are collected and validated as structured JSON instead of being treated as free-form text.
-- Refreshed the bilingual README pair and the live public-eval snapshot for the March 30, 2026 verification pass while explicitly marking the retained benchmark and real-network artifacts as reused older snapshots.
+- Moved the default coordinator tool order in `easy-agent.yml` so GitHub issue listing, repair-package prep, local commit, and release publishing are available before the demo echo tools.
+- Tightened duplicate successful tool-call suppression so a second call that only adds optional schema-declared arguments reuses the first successful result instead of executing again.
+- Grounded tau public-eval cases more aggressively from prior tool history by extracting known task ids into a synthetic memory message.
+- Hardened federation client delivery so `run_remote()` auto-discovers the remote base path before sending tasks, and fixed the real-network replay resilience scenario to read the task payload returned by `get_task()` correctly.
+- Refreshed the bilingual README pair for the March 30, 2026 verification pass, added local GitHub automation setup notes, and synchronized the refreshed real-network matrix while explicitly keeping the older benchmark and public-eval artifacts marked as retained snapshots.
 
 ### Verified
 
 - `.\.venv\Scripts\python.exe -m ruff check src tests scripts`
 - `.\.venv\Scripts\python.exe -m mypy src tests scripts`
-- `.\.venv\Scripts\python.exe -m pytest tests/unit/test_protocols.py tests/unit/test_public_eval.py tests/unit/test_mcp.py -q --basetemp=%TEMP%\easy-agent-pytest\unit-targeted-<timestamp>` with `22 passed`
-- `.\.venv\Scripts\python.exe -m pytest tests/unit -q --basetemp=%TEMP%\easy-agent-pytest\unit-full-<timestamp>` with `83 passed`
-- `.\.venv\Scripts\python.exe -m pytest tests/integration -m real -q --basetemp=%TEMP%\easy-agent-pytest\integration-full-<timestamp>` with `5 passed`
-- Python helper calling `run_public_eval_suite('easy-agent.yml')` refreshed `.easy-agent/public-eval-report.json` with `overall.bfcl_pass_rate = 0.8750`, `bfcl_irrelevance_pass_rate = 1.0000`, and `tau2_mock_pass_rate = 0.6667`
+- `.\.venv\Scripts\python.exe -m pytest tests/integration/test_real_network_eval.py -m real -q` with `1 passed`
+- Repo-local Python verification wrote `.easy-agent/manual-verify/20260330-github-fed/manual-verification-report.json` and passed coverage for GitHub automation helpers, optional skill loading, duplicate-call suppression, tau history grounding, and federation auto-discovery.
+- `.easy-agent/real-network-report.json` was refreshed with `5 passed`, `0 failed`, and `5 skipped` across 10 scenarios.
 
 ## [0.3.2] - 2026-03-27
 

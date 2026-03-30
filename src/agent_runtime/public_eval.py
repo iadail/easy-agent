@@ -136,6 +136,7 @@ def _tau_system_prompt() -> str:
         'You are a precise task assistant. Use the provided task-management tools only when the user explicitly wants an action taken. '
         'Prefer updating an existing matching task over creating a duplicate. '
         'If previous conversation state is present, continue from it and infer task ids from prior tool outputs instead of asking again. '
+        'When a single recent task in history clearly matches phrases like the task or that task, update it directly without a follow-up question. '
         'Acknowledge successful completion concisely after the required tool calls finish.'
     )
 
@@ -296,6 +297,45 @@ def _summarize_result(result: Any) -> str:
     if isinstance(result, str):
         return result[:200]
     return json.dumps(result, ensure_ascii=False)[:200]
+
+
+def _extract_tau_tasks_from_history(message_history: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    tasks: dict[str, dict[str, Any]] = {}
+    for item in message_history:
+        if item.get('role') != 'tool':
+            continue
+        content = str(item.get('content', '')).strip()
+        if not content:
+            continue
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict) or 'task_id' not in payload:
+            continue
+        task_id = str(payload['task_id'])
+        tasks[task_id] = {
+            'task_id': task_id,
+            'user_id': str(payload.get('user_id') or 'user_1'),
+            'title': str(payload.get('title') or ''),
+            'description': str(payload.get('description') or ''),
+            'status': str(payload.get('status') or 'pending'),
+        }
+    return tasks
+
+
+def _tau_history_memory_message(tasks: dict[str, dict[str, Any]]) -> str | None:
+    if not tasks:
+        return None
+    ordered = list(tasks.values())[-4:]
+    lines = [
+        'Conversation memory for task grounding. Reuse these task ids directly when the user refers to the previously discussed task:',
+    ]
+    for item in ordered:
+        lines.append(
+            f"- {item['task_id']}: title={item['title']!r}, status={item['status']!r}, description={item['description']!r}"
+        )
+    return '\n'.join(lines)
 
 
 def _tokenize_public_eval_text(value: str) -> set[str]:
@@ -652,8 +692,9 @@ async def _run_tau_case(base_config: AppConfig, case: dict[str, Any]) -> PublicE
         try:
             await runtime.start()
             session_id = f"tau2-{case['id']}"
+            message_history = list(case.get('initial_state', {}).get('message_history', []))
             initial_messages = []
-            for item in case.get('initial_state', {}).get('message_history', []):
+            for item in message_history:
                 if item['role'] == 'assistant' and item.get('tool_calls'):
                     calls = [ToolCall.model_validate(call) for call in item['tool_calls']]
                     initial_messages.append(ChatMessage(role='assistant', content=item.get('content', ''), tool_calls=calls))
@@ -668,16 +709,17 @@ async def _run_tau_case(base_config: AppConfig, case: dict[str, Any]) -> PublicE
                     )
                 else:
                     initial_messages.append(ChatMessage(role=item['role'], content=item.get('content', '')))
+            history_tasks = _extract_tau_tasks_from_history(message_history)
+            if history_tasks:
+                tasks.update(history_tasks)
+                numeric_ids = [int(item.split('_')[-1]) for item in history_tasks if item.startswith('task_') and item.split('_')[-1].isdigit()]
+                if numeric_ids:
+                    task_counter = max(task_counter, max(numeric_ids))
+            memory_message = _tau_history_memory_message(history_tasks)
+            if memory_message:
+                initial_messages.append(ChatMessage(role='system', content=memory_message))
             if initial_messages:
                 runtime.store.save_session_messages(session_id, config.graph.name, initial_messages)
-                tasks['task_2'] = {
-                    'task_id': 'task_2',
-                    'user_id': 'user_1',
-                    'title': 'Project Review',
-                    'description': 'Review Q4 project status',
-                    'status': 'pending',
-                }
-                task_counter = 2
             prompt = str(case.get('ticket') or case.get('user_scenario', {}).get('instructions', ''))
             existing_tasks = [f"{item['task_id']}:{item['title']}:{item['status']}" for item in tasks.values()]
             if existing_tasks:

@@ -454,7 +454,12 @@ class AgentOrchestrator:
                 name=tool_call.name,
                 tool_call_id=tool_call.id,
             )
-        duplicate_hit, cached_output = self._lookup_successful_tool_result(tool_call.name, validation.normalized, context)
+        duplicate_hit, cached_output = self._lookup_successful_tool_result(
+            tool_spec,
+            tool_call.name,
+            validation.normalized,
+            context,
+        )
         if duplicate_hit:
             self.store.record_event(
                 context.run_id,
@@ -554,15 +559,27 @@ class AgentOrchestrator:
 
     def _lookup_successful_tool_result(
         self,
+        tool_spec: ToolSpec,
         tool_name: str,
         arguments: dict[str, Any],
         context: RunContext,
     ) -> tuple[bool, Any]:
         cache = self._successful_tool_cache(context)
         cached = cache.get(self._tool_cache_key(tool_name, arguments))
-        if not isinstance(cached, dict) or 'result' not in cached:
-            return False, None
-        return True, cached['result']
+        if isinstance(cached, dict) and 'result' in cached:
+            return True, cached['result']
+        for cache_key, payload in cache.items():
+            if not isinstance(payload, dict) or 'result' not in payload:
+                continue
+            cached_tool_name = str(payload.get('tool_name') or '')
+            if cached_tool_name and cached_tool_name != tool_name:
+                continue
+            if not cached_tool_name and not str(cache_key).startswith(f'{tool_name}:'):
+                continue
+            previous_arguments = payload.get('arguments')
+            if self._is_optional_argument_superset_duplicate(tool_spec, previous_arguments, arguments):
+                return True, payload['result']
+        return False, None
 
     def _remember_successful_tool_result(
         self,
@@ -572,7 +589,48 @@ class AgentOrchestrator:
         context: RunContext,
     ) -> None:
         cache = self._successful_tool_cache(context)
-        cache[self._tool_cache_key(tool_name, arguments)] = {'result': output}
+        cache[self._tool_cache_key(tool_name, arguments)] = {
+            'tool_name': tool_name,
+            'arguments': dict(arguments),
+            'result': output,
+        }
+
+    @staticmethod
+    def _is_optional_argument_superset_duplicate(
+        tool_spec: ToolSpec,
+        previous_arguments: Any,
+        current_arguments: dict[str, Any],
+    ) -> bool:
+        if not isinstance(previous_arguments, dict):
+            return False
+        if previous_arguments == current_arguments:
+            return True
+        schema = tool_spec.input_schema if isinstance(tool_spec.input_schema, dict) else {}
+        schema_type = str(schema.get('type', 'object'))
+        if schema_type not in {'object', 'dict'}:
+            return False
+        properties = schema.get('properties', {})
+        if not isinstance(properties, dict):
+            properties = {}
+        required = {str(item) for item in schema.get('required', [])}
+        if not required:
+            return False
+        for key in required:
+            if key not in previous_arguments or key not in current_arguments:
+                return False
+            if previous_arguments[key] != current_arguments[key]:
+                return False
+        for key, value in previous_arguments.items():
+            if key not in current_arguments or current_arguments[key] != value:
+                return False
+        extra_keys = set(current_arguments) - set(previous_arguments)
+        if not extra_keys:
+            return False
+        if any(key in required for key in extra_keys):
+            return False
+        if any(key not in properties for key in extra_keys):
+            return False
+        return True
 
     @staticmethod
     def _successful_tool_cache(context: RunContext) -> dict[str, Any]:
